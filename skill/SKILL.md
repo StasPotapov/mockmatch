@@ -1,6 +1,6 @@
 ---
-name: cdpm
-description: "Drives a headless browser for the agent while it builds a website, and checks the site against the design, with deterministic commands instead of guessing from screenshots: reads the page as compact text, clicks by text and reports what changed, types, presses keys, scrolls, waits and asserts, runs several steps in one call, reads console errors and failed requests, shows computed styles, changes viewport size and theme. Its main job is the design check: `cdpm compare` takes a Claude Design canvas frame (or an HTML mockup, or a PNG) and the site, matches elements and lists what differs — missing and extra elements, font, size, weight, color, padding, radius, size and spacing — then a pixel diff with regions and crops, an HTML board for the person and a subagent verdict. - Any browser task while building or checking a site: \"open the site\", \"what is on the page\", \"click Sign in\", \"fill in the form\", \"any console errors\", \"why is the button grey\", \"how does it look at 390 px\", \"dark theme\". Design checks: \"does it match the design\", \"compare with the mockup / Claude Design\", \"make it like in the design\", \"pixel perfect\", \"what differs from the layout\"."
+name: mockmatch
+description: "Drives a headless browser for the agent while it builds a website, and checks the site against the design, with deterministic commands instead of guessing from screenshots: reads the page as compact text, clicks by text and reports what changed, types, presses keys, scrolls, waits and asserts, runs several steps in one call, reads console errors and failed requests, shows computed styles, changes viewport size and theme. Its main job is the design check: `mockmatch compare` takes a Claude Design canvas frame (or an HTML mockup, or a PNG) and the site, matches elements and lists what differs — missing and extra elements, font, size, weight, color, padding, radius, size and spacing — then a pixel diff with regions and crops, an HTML board for the person and a subagent verdict. - Any browser task while building or checking a site: \"open the site\", \"what is on the page\", \"click Sign in\", \"fill in the form\", \"any console errors\", \"why is the button grey\", \"how does it look at 390 px\", \"dark theme\". Design checks: \"does it match the design\", \"compare with the mockup / Claude Design\", \"make it like in the design\", \"pixel perfect\", \"what differs from the layout\"."
 argument-hint: "<what to do or check> [--width 1440,390]"
 allowed-tools:
   - Bash
@@ -12,9 +12,9 @@ allowed-tools:
   - Agent
 ---
 
-# CDPM — Chrome DevTools Protocol Matrix
+# mockmatch
 
-CDPM is how you work with a browser while building a website. Use it instead of a browser MCP or raw
+mockmatch is how you work with a browser while building a website. Use it instead of a browser MCP or raw
 Playwright. Its commands are deterministic: `click` finds the element by text and reports what appeared
 and what went away, `--expect`, `wait` and `assert` confirm a page with one line and an exit code,
 `compare` computes design differences in Python. Trust their output; do not look at a screenshot to decide
@@ -25,12 +25,12 @@ It has two layers:
 - **Browser control.** One headless Chromium per project lives in the background between calls,
   so the page state (logins, open menus, filled forms) survives. One command per action.
 - **Design check.** `compare` matches the site against a design frame element by element, then pixel
-  by pixel, writes a run folder with an HTML board, and the `cdpm-eyes` subagent judges the crops.
+  by pixel, writes a run folder with an HTML board, and the `mockmatch-eyes` subagent judges the crops.
 
-The CLI is `bin/cdpm` of this skill: `CDPM="${CLAUDE_SKILL_DIR}/bin/cdpm"`. If the variable is not
+The CLI is `bin/mockmatch` of this skill: `mockmatch="${CLAUDE_SKILL_DIR}/bin/mockmatch"`. If the variable is not
 substituted, take the folder from the "Base directory for this skill" line. Run commands from the
-project root: files go to `<project>/build/cdpm/`. The project is the git root of the current folder;
-`CDPM_PROJECT=<path>` overrides it. Help: `"$CDPM" <command> -h`. Commands below omit the prefix; set the
+project root: files go to `<project>/build/mockmatch/`. The project is the git root of the current folder;
+`MOCKMATCH_PROJECT=<path>` overrides it. Help: `"$mockmatch" <command> -h`. Commands below omit the prefix; set the
 variable in every Bash call (it does not persist). First use on a machine: `doctor`, and if it reports
 something missing, `doctor --install` (a private venv with Playwright, Chromium and Pillow).
 
@@ -75,7 +75,7 @@ Read `reference/design-check.md` before the first `compare` in a session. The sh
    sizes, colors, padding. `(+N inside moved)` means children only shifted because of this box: fix the
    box. Run `compare` again until no `!` lines remain. Exit code 1 means major differences remain.
 5. **Eyes.** When only `~` lines and pixel regions remain, or the person wants a verdict, start the
-   `cdpm-eyes` subagent (see `reference/design-check.md`, "Verdict"). Then `board` and give the person
+   `mockmatch-eyes` subagent (see `reference/design-check.md`, "Verdict"). Then `board` and give the person
    the board path.
 
 ## Rules
@@ -94,4 +94,4 @@ Read `reference/design-check.md` before the first `compare` in a session. The sh
 - `reference/design-check.md` — compare in detail: design sources, frames, widths and themes, reading the
   output, tolerances, the eyes subagent, the board.
 - `reference/troubleshooting.md` — the browser does not start, fonts differ, nothing matches.
-- `agents/cdpm-eyes.md` — the verdict subagent.
+- `agents/mockmatch-eyes.md` — the verdict subagent.

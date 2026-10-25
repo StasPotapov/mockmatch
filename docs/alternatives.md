@@ -2,7 +2,7 @@
 
 [Русский](alternatives.ru.md)
 
-What existed in October 2026 when cdpm was started, and why cdpm was still written. The facts below come
+What existed in October 2026 when mockmatch was started, and why mockmatch was still written. The facts below come
 from project pages and directory listings; none of these tools was installed and measured.
 
 ## Browser control for agents
@@ -11,10 +11,10 @@ from project pages and directory listings; none of these tools was installed and
 |---|---|---|
 | [agent-browser](https://agent-browser.dev/) (Vercel Labs) | CLI; `snapshot` gives an accessibility tree with `@e1` refs, ~200–400 tokens per snapshot by the authors' numbers | control only, no design check |
 | [Playwright CLI](https://www.webfuse.com/blog/playwright-mcp-vs-playwright-cli) | writes snapshots and screenshots to files instead of the context; cited ~27k vs ~114k tokens per task against Playwright MCP (origin of the number unclear) | control only |
-| Playwright MCP, chrome-devtools-mcp | MCP servers; snapshots go into the context inline | the token cost cdpm avoids |
-| [CDPM](https://github.com/IGELHARINE/CDPM) (IGELHARINE, npm `cdpm-mcp`) | MCP server; up to 30 numbered, logged-in Chrome slots over raw CDP, shared by many Claude Code sessions and subagents, with messages between agents | a different tool with the same name, found after cdpm was named; shared browsers for many agents, no design check |
+| Playwright MCP, chrome-devtools-mcp | MCP servers; snapshots go into the context inline | the token cost mockmatch avoids |
+| [CDPM](https://github.com/IGELHARINE/CDPM) (IGELHARINE, npm `cdpm-mcp`) | MCP server; up to 30 numbered, logged-in Chrome slots over raw CDP, shared by many Claude Code sessions and subagents, with messages between agents | shared browsers for many agents, no design check. This tool was first named cdpm too and was renamed to mockmatch to avoid the clash |
 
-cdpm takes the same idea (text with refs, results in files) and adds a report of what changed after
+mockmatch takes the same idea (text with refs, results in files) and adds a report of what changed after
 each click, `--expect`, and the design check.
 
 ## Design vs implementation

@@ -1,11 +1,11 @@
-# Design check with `cdpm compare`
+# Design check with `mockmatch compare`
 
 `compare` answers "does the site look like the design" with text the agent can act on. It renders the
 design and the site in the same headless Chromium at the same width, with animations off, fonts loaded
 and the frame snapped to whole pixels. Then it does two passes:
 
 1. **Elements.** Both pages are walked: every element with its own text, every image or icon, every box
-   with a background, border or shadow. Elements are paired by `data-cdpm` / `data-testid`, then by exact
+   with a background, border or shadow. Elements are paired by `data-mockmatch` / `data-testid`, then by exact
    text, then by similar text and position. For each pair it compares font family, size, weight, style,
    line height, letter spacing, color, text transform and decoration, background, border, radius,
    shadow, padding, opacity, width, height, x, and the gap to the element above.
@@ -16,13 +16,13 @@ and the frame snapped to whole pixels. Then it does two passes:
 
 | Source | How |
 |---|---|
-| Claude Design | `render_preview` (MCP `claude_design`) → `serve_url`, then `cdpm pull "<serve_url>" --out design`. The URL holds a token and lives ~1 hour: do not write it into files, do not show it. `pull` saves the rendered page without scripts and the token; commit `design/` so the check repeats without the MCP. |
+| Claude Design | `render_preview` (MCP `claude_design`) → `serve_url`, then `mockmatch pull "<serve_url>" --out design`. The URL holds a token and lives ~1 hour: do not write it into files, do not show it. `pull` saves the rendered page without scripts and the token; commit `design/` so the check repeats without the MCP. |
 | HTML mockup in the repo | `--design path/to/mockup.html` as is |
 | A live URL | `--design https://…` (for example the old version of the site) |
 | PNG / JPG | `--design mock.png`: pixels only, no element lines; the viewport width is the image width |
 
 Claude Design files are canvases: one file holds several options side by side (`1a`, `1b`, …), each a
-fixed-width card. `cdpm frames design/<file>.html` lists them:
+fixed-width card. `mockmatch frames design/<file>.html` lists them:
 
 ```
 Claude Design canvas: 2 frames
@@ -35,7 +35,7 @@ another scale or the person names the option, use what they say.
 
 ## The site side
 
-- **Without `--site`** — the current tab of the running browser (`cdpm open …`), with its state: a logged-in
+- **Without `--site`** — the current tab of the running browser (`mockmatch open …`), with its state: a logged-in
   page, an open menu, a filled form. Its viewport is switched to the compared width and back.
 - **`--site <url>`** — a fresh page, no state.
 - **`--site-frame <selector>`** — compare only part of the site (a component, a section) with the frame.
@@ -81,11 +81,11 @@ Lines are capped at `--lines 40`; the full list is in `<cell>/issues.txt`, every
 ## Fixing loop
 
 1. Fix `missing` and `!` lines from the top: structure first, then typography, then color and spacing.
-2. Find the CSS for an element: `cdpm style "<text>"` shows its computed styles on the site.
+2. Find the CSS for an element: `mockmatch style "<text>"` shows its computed styles on the site.
 3. Rerun the same `compare` command. Stop when no `!` lines remain and the person's checklist is met.
    Do not chase `~` lines of 1–3 px forever: say what remains.
 4. If the site uses different markup and pairing fails (many `missing` plus `extra` for the same
-   texts), add `data-cdpm="<name>"` to the key elements on both sides, or compare a part with
+   texts), add `data-mockmatch="<name>"` to the key elements on both sides, or compare a part with
    `--site-frame`.
 
 ## Tolerances
@@ -98,11 +98,11 @@ Lines are capped at `--lines 40`; the full list is in `<cell>/issues.txt`, every
 ## Verdict
 
 When pixel regions remain that the element lines do not explain, or the person wants a verdict, start
-the `cdpm-eyes` subagent (Agent tool, `subagent_type: cdpm-eyes`) with:
+the `mockmatch-eyes` subagent (Agent tool, `subagent_type: mockmatch-eyes`) with:
 
 - **Task** — what the page is and what was built.
-- **Run** — `build/cdpm/<run>` from the last line of `compare`.
-- **CDPM** — the full path to the CLI.
+- **Run** — `build/mockmatch/<run>` from the last line of `compare`.
+- **mockmatch** — the full path to the CLI.
 - **Lines** — the `compare` output.
 
 It reads only the crops, writes `notes.md` with MATCH / PROBLEM / REVIEW per region and rebuilds the
@@ -110,5 +110,5 @@ board. Fix the PROBLEM lines; tell the person about REVIEW lines.
 
 ## Board
 
-`cdpm board [run] [--open]` builds `board.html`: the summary, the verdict, the element lines, a swipe
+`mockmatch board [run] [--open]` builds `board.html`: the summary, the verdict, the element lines, a swipe
 view "design ◀ ▶ site", the diff overlay and the crops. Give the person the path; do not read it yourself.

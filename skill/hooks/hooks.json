@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skill/hooks/cdpm-guard.py\""
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skill/hooks/mockmatch-guard.py\""
           }
         ]
       }

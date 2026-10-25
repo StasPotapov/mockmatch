@@ -1,4 +1,4 @@
-"""Tests for cdpm. Run with the cdpm venv: ~/.local/share/cdpm/venv/bin/python -m pytest tests -q
+"""Tests for mockmatch. Run with the mockmatch venv: ~/.local/share/mockmatch/venv/bin/python -m pytest tests -q
 
 Unit tests need nothing; the browser tests need Playwright with Chromium and are skipped without it.
 """
@@ -12,14 +12,14 @@ import sys
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLI = os.path.join(ROOT, "skill", "bin", "cdpm")
+CLI = os.path.join(ROOT, "skill", "bin", "mockmatch")
 FIX = os.path.join(ROOT, "tests", "fixtures")
 
-os.environ["CDPM_NO_VENV"] = "1"
-_loader = importlib.machinery.SourceFileLoader("cdpm", CLI)
-_spec = importlib.util.spec_from_loader("cdpm", _loader)
-cdpm = importlib.util.module_from_spec(_spec)
-_loader.exec_module(cdpm)
+os.environ["MOCKMATCH_NO_VENV"] = "1"
+_loader = importlib.machinery.SourceFileLoader("mockmatch", CLI)
+_spec = importlib.util.spec_from_loader("mockmatch", _loader)
+mockmatch = importlib.util.module_from_spec(_spec)
+_loader.exec_module(mockmatch)
 
 try:
     import playwright  # noqa: F401
@@ -31,15 +31,15 @@ except ImportError:
 # --- pure helpers ----------------------------------------------------------------------------
 
 def test_colors():
-    assert cdpm.hexcolor("rgb(42, 98, 214)") == "#2a62d6"
-    assert cdpm.hexcolor("rgba(0, 0, 0, 0.5)") == "#000000/0.5"
-    assert cdpm.color_dist("rgb(0, 0, 0)", "rgb(0, 0, 10)") == 10
-    assert cdpm.color_dist("rgba(1, 2, 3, 0)", "rgba(200, 0, 0, 0)") == 0
+    assert mockmatch.hexcolor("rgb(42, 98, 214)") == "#2a62d6"
+    assert mockmatch.hexcolor("rgba(0, 0, 0, 0.5)") == "#000000/0.5"
+    assert mockmatch.color_dist("rgb(0, 0, 0)", "rgb(0, 0, 10)") == 10
+    assert mockmatch.color_dist("rgba(1, 2, 3, 0)", "rgba(200, 0, 0, 0)") == 0
 
 
 def test_redact_hides_token():
     url = "https://abc.claudeusercontent.com/v1/design/projects/abc/serve/Page%20one.dc.html?t=secret123&direct=1"
-    r = cdpm.redact(url)
+    r = mockmatch.redact(url)
     assert "secret123" not in r
     assert r.endswith("Page one.dc.html")
 
@@ -49,17 +49,17 @@ def test_compact_styles():
           "padding-bottom": "8px", "padding-left": "8px", "border-top-width": "0px",
           "border-top-left-radius": "4px", "border-top-right-radius": "4px",
           "border-bottom-right-radius": "4px", "border-bottom-left-radius": "4px"}
-    c = cdpm.compact_styles(st)
+    c = mockmatch.compact_styles(st)
     assert c == {"font-size": "16px", "border-radius": "4px", "padding": "8px"}
 
 
 def test_parse_size():
-    assert cdpm.parse_size("390x844") == (390, 844)
-    assert cdpm.parse_size("1440") == (1440, 900)
+    assert mockmatch.parse_size("390x844") == (390, 844)
+    assert mockmatch.parse_size("1440") == (1440, 900)
 
 
 def _item(i, text, x, y, w=100, h=20, kind="text", tag="div", par=-1, **st):
-    base = {p: "" for p in cdpm.STYLE_PROPS}
+    base = {p: "" for p in mockmatch.STYLE_PROPS}
     base.update({"font-family": "Inter", "font-size": "16px", "font-weight": "400", "font-style": "normal",
                  "line-height": "20px", "letter-spacing": "normal", "color": "rgb(0, 0, 0)",
                  "text-transform": "none", "text-decoration-line": "none", "background-color": "rgba(0, 0, 0, 0)",
@@ -80,8 +80,8 @@ def test_compare_finds_style_missing_and_extra():
     frame = {"w": 800, "h": 600}
     D = [_item(0, "Title", 0, 0, font_size="48px"), _item(1, "Buy now", 0, 100), _item(2, "Docs", 0, 200)]
     S = [_item(0, "Title", 0, 0, font_size="40px"), _item(1, "Buy now", 0, 100), _item(2, "Extra", 0, 400)]
-    issues, pairs, score = cdpm.compare_items(D, S, frame, frame, dict(px=1, geo=2, font=0.5, color=6))
-    lines = [cdpm.issue_line(i) for i in issues]
+    issues, pairs, score = mockmatch.compare_items(D, S, frame, frame, dict(px=1, geo=2, font=0.5, color=6))
+    lines = [mockmatch.issue_line(i) for i in issues]
     assert any("font-size 48→40" in x for x in lines)
     assert any(x.startswith("! missing") and "Docs" in x for x in lines)
     assert any(x.startswith("~ extra") and "Extra" in x for x in lines)
@@ -92,8 +92,8 @@ def test_compare_fuzzy_text_and_gap():
     frame = {"w": 800, "h": 600}
     D = [_item(0, "Header", 0, 0), _item(1, "Text lines, not images.", 0, 40)]
     S = [_item(0, "Header", 0, 0), _item(1, "Text lines instead of images.", 0, 52)]
-    issues, pairs, _ = cdpm.compare_items(D, S, frame, frame, dict(px=1, geo=2, font=0.5, color=6))
-    line = cdpm.issue_line(issues[0])
+    issues, pairs, _ = mockmatch.compare_items(D, S, frame, frame, dict(px=1, geo=2, font=0.5, color=6))
+    line = mockmatch.issue_line(issues[0])
     assert 'text "Text lines, not images."→"Text lines instead of images."' in line
     assert "gap-above 20→32" in line
 
@@ -104,30 +104,30 @@ def test_children_of_a_changed_box_fold():
          _item(1, "Inside", 20, 20, par=0)]
     S = [_item(0, "Card", 0, 0, w=300, h=92, kind="box", padding_top="16px"),
          _item(1, "Inside", 16, 16, par=0)]
-    issues, _, _ = cdpm.compare_items(D, S, frame, frame, dict(px=1, geo=2, font=0.5, color=6))
+    issues, _, _ = mockmatch.compare_items(D, S, frame, frame, dict(px=1, geo=2, font=0.5, color=6))
     assert len(issues) == 1
-    assert "(+1 inside moved)" in cdpm.issue_line(issues[0])
+    assert "(+1 inside moved)" in mockmatch.issue_line(issues[0])
 
 
 def test_guard_hook():
-    hook = os.path.join(ROOT, "skill", "hooks", "cdpm-guard.py")
+    hook = os.path.join(ROOT, "skill", "hooks", "mockmatch-guard.py")
 
     def run(path):
         r = subprocess.run([sys.executable, hook], input=json.dumps({"tool_input": {"file_path": path}}),
                            capture_output=True, text=True)
         return r.stdout
 
-    assert "deny" in run("/p/build/cdpm/20261025-101010-x/1280/site.png")
-    assert "deny" in run("/p/build/cdpm/shots/home.png")
-    assert run("/p/build/cdpm/20261025-101010-x/1280/diff/r1.png") == ""
-    assert run("/p/build/cdpm/look/101010.png") == ""
+    assert "deny" in run("/p/build/mockmatch/20261025-101010-x/1280/site.png")
+    assert "deny" in run("/p/build/mockmatch/shots/home.png")
+    assert run("/p/build/mockmatch/20261025-101010-x/1280/diff/r1.png") == ""
+    assert run("/p/build/mockmatch/look/101010.png") == ""
 
 
 # --- browser ---------------------------------------------------------------------------------
 
 def cli(*args, cwd):
-    env = dict(os.environ, CDPM_PROJECT=str(cwd))
-    env.pop("CDPM_NO_VENV", None)
+    env = dict(os.environ, MOCKMATCH_PROJECT=str(cwd))
+    env.pop("MOCKMATCH_NO_VENV", None)
     return subprocess.run([sys.executable, CLI, *args], capture_output=True, text=True, env=env, timeout=180)
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cdpm — Chrome DevTools Protocol Matrix.
+"""mockmatch — design-vs-site checks and browser control for agents.
 
 CLI for building a website as an agent: a headless Chromium kept alive between calls is driven
 with deterministic commands (the page as compact text, clicks by text that report what changed),
@@ -8,7 +8,7 @@ PNG): computed styles and geometry element by element, then a pixel diff with re
 Images do not enter the agent's context: the agent reads lines of text.
 
 Requirements: Python 3.9+, Playwright for Python with Chromium, Pillow.
-`cdpm doctor --install` puts them into a private venv (~/.local/share/cdpm/venv).
+`mockmatch doctor --install` puts them into a private venv (~/.local/share/mockmatch/venv).
 """
 import argparse
 import datetime as dt
@@ -28,7 +28,7 @@ import time
 import urllib.parse
 
 VERSION = "0.1.0"
-HOME_DIR = os.path.expanduser(os.environ.get("CDPM_HOME", "~/.local/share/cdpm"))
+HOME_DIR = os.path.expanduser(os.environ.get("MOCKMATCH_HOME", "~/.local/share/mockmatch"))
 VENV = os.path.join(HOME_DIR, "venv")
 VENV_PY = os.path.join(VENV, "bin", "python")
 SELF = os.path.realpath(__file__)
@@ -37,7 +37,7 @@ SELF = os.path.realpath(__file__)
 # --- bootstrap: run under the private venv when the system Python has no Playwright -----------
 
 def _bootstrap():
-    if os.environ.get("CDPM_NO_VENV") or len(sys.argv) > 1 and sys.argv[1] == "doctor":
+    if os.environ.get("MOCKMATCH_NO_VENV") or len(sys.argv) > 1 and sys.argv[1] == "doctor":
         return
     try:
         import playwright  # noqa: F401
@@ -47,7 +47,7 @@ def _bootstrap():
         pass
     if os.path.exists(VENV_PY) and os.path.realpath(sys.prefix) != os.path.realpath(VENV):
         os.execv(VENV_PY, [VENV_PY, SELF] + sys.argv[1:])
-    sys.stderr.write("cdpm: Playwright or Pillow is missing. Run: cdpm doctor --install\n")
+    sys.stderr.write("mockmatch: Playwright or Pillow is missing. Run: mockmatch doctor --install\n")
     sys.exit(3)
 
 
@@ -69,7 +69,7 @@ def out(*parts):
 
 
 def die(msg, code=2):
-    out(f"cdpm: {msg}")
+    out(f"mockmatch: {msg}")
     sys.exit(code)
 
 
@@ -95,7 +95,7 @@ def record_stats(cmd, saved=0):
 # --- project, runs, session ------------------------------------------------------------------
 
 def project_root():
-    p = os.environ.get("CDPM_PROJECT")
+    p = os.environ.get("MOCKMATCH_PROJECT")
     if p:
         return os.path.abspath(p)
     try:
@@ -108,7 +108,7 @@ def project_root():
 
 
 def cache_dir():
-    d = os.path.join(project_root(), "build", "cdpm")
+    d = os.path.join(project_root(), "build", "mockmatch")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -141,7 +141,7 @@ def find_run(name=None):
         try:
             name = open(os.path.join(base, "current")).read().strip()
         except OSError:
-            die("no run yet: start one with cdpm compare")
+            die("no run yet: start one with mockmatch compare")
     if os.path.isdir(name):
         return os.path.abspath(name)
     cands = sorted(x for x in os.listdir(base) if os.path.isdir(os.path.join(base, x)) and name in x)
@@ -229,7 +229,7 @@ def cmd_daemon(a):
         ctx.new_page()
         s.update(pid=os.getpid(), ready=True, applied=s.get("rev", 0))
         save_session(s)
-        idle = float(os.environ.get("CDPM_IDLE_HOURS", "3")) * 3600
+        idle = float(os.environ.get("MOCKMATCH_IDLE_HOURS", "3")) * 3600
         while True:
             pages = ctx.pages
             pg = pages[0] if pages else ctx.new_page()
@@ -259,7 +259,7 @@ def start_daemon(width=1280, height=900, theme="light", locale="en-US"):
     s = dict(port=free_port(), width=width, height=height, theme=theme, locale=locale,
              rev=0, used=time.time(), started=dt.datetime.now().isoformat(timespec="seconds"))
     save_session(s)
-    env = dict(os.environ, CDPM_PROJECT=project_root())
+    env = dict(os.environ, MOCKMATCH_PROJECT=project_root())
     with open(os.path.join(cache_dir(), "daemon.log"), "a") as lf:
         subprocess.Popen([sys.executable, SELF, "_daemon"], stdout=lf, stderr=lf, env=env,
                          start_new_session=True, cwd=project_root())
@@ -268,7 +268,7 @@ def start_daemon(width=1280, height=900, theme="light", locale="en-US"):
         s = load_session() or {}
         if s.get("ready"):
             return s
-    die("the browser did not start; see build/cdpm/daemon.log")
+    die("the browser did not start; see build/mockmatch/daemon.log")
 
 
 class Session:
@@ -279,7 +279,7 @@ class Session:
         s = load_session()
         if not s or not alive(s.get("pid")):
             if need:
-                die("no browser: start one with cdpm open <url>")
+                die("no browser: start one with mockmatch open <url>")
         self.s = s
         self._own = pw is None
         self._p = sync_playwright().start() if pw is None else pw
@@ -288,7 +288,7 @@ class Session:
         pages = self.ctx.pages
         self.page = pages[min(s.get("tab", len(pages) - 1), len(pages) - 1)] if pages else self.ctx.new_page()
         self.page.emulate_media(color_scheme=s.get("theme") or "light")
-        self.page.set_default_timeout(float(os.environ.get("CDPM_TIMEOUT", "8")) * 1000)
+        self.page.set_default_timeout(float(os.environ.get("MOCKMATCH_TIMEOUT", "8")) * 1000)
         s["used"] = time.time()
         save_session(s)
 
@@ -357,7 +357,7 @@ const ownText = e => norm([...e.childNodes].filter(c => c.nodeType === 3).map(c 
 JS_UI = JS_HELPERS + r"""
 (opts) => {
   const all = opts.all, max = opts.max, find = (opts.find || '').toLowerCase();
-  document.querySelectorAll('[data-cdpm-ref]').forEach(e => e.removeAttribute('data-cdpm-ref'));
+  document.querySelectorAll('[data-mockmatch-ref]').forEach(e => e.removeAttribute('data-mockmatch-ref'));
   const vh = innerHeight, vw = innerWidth;
   const lines = []; let n = 0, below = 0, above = 0;
   const LAND = {HEADER:'header', NAV:'nav', MAIN:'main', FOOTER:'footer', ASIDE:'aside', DIALOG:'dialog', FORM:'form'};
@@ -380,7 +380,7 @@ JS_UI = JS_HELPERS + r"""
     if (land) { emit(e, '# ' + land + (e.getAttribute('aria-label') ? ' "' + norm(e.getAttribute('aria-label')) + '"' : '')); }
     if (e.matches(INTER) || (e.tabIndex >= 0 && getComputedStyle(e).cursor === 'pointer' && t !== 'BODY')) {
       const ref = 'e' + (++n);
-      e.setAttribute('data-cdpm-ref', ref);
+      e.setAttribute('data-mockmatch-ref', ref);
       let line = ref + ' ' + roleOf(e) + ' "' + nameOf(e).slice(0, 80) + '"';
       if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') {
         if (e.type === 'checkbox' || e.type === 'radio') line += e.checked ? ' [x]' : ' [ ]';
@@ -454,8 +454,8 @@ JS_FIND = JS_HELPERS + r"""
   }
   if (!best) return null;
   if (!best.matches(INTER)) { const up = best.closest(INTER); if (up && nameOf(up).toLowerCase().includes(want)) best = up; }
-  let ref = best.getAttribute('data-cdpm-ref');
-  if (!ref) { ref = 'f' + Math.random().toString(36).slice(2, 8); best.setAttribute('data-cdpm-ref', ref); }
+  let ref = best.getAttribute('data-mockmatch-ref');
+  if (!ref) { ref = 'f' + Math.random().toString(36).slice(2, 8); best.setAttribute('data-mockmatch-ref', ref); }
   return {ref, name: nameOf(best).slice(0, 80), role: best.matches(INTER) ? roleOf(best) : best.tagName.toLowerCase()};
 }
 """
@@ -496,13 +496,13 @@ JS_EXTRACT = JS_HELPERS + r"""
       const bordered = ['Top','Right','Bottom','Left'].some(k => parseFloat(s['border' + k + 'Width']) > 0 && s['border' + k + 'Style'] !== 'none');
       const box = (!transparent(bg) && bg !== parentBg) || bordered || s.boxShadow !== 'none' || /gradient/.test(s.backgroundImage);
       const inter = e.matches(INTER);
-      if (own || img || box || inter || e.dataset.cdpm || e.dataset.testid) {
+      if (own || img || box || inter || e.dataset.mockmatch || e.dataset.testid) {
         const st = {};
         for (const p of PROPS) st[p] = s.getPropertyValue(p);
         me = items.length;
         items.push({
           i: items.length, tag: t.toLowerCase(), depth, par,
-          key: e.dataset.cdpm || e.dataset.testid || '',
+          key: e.dataset.mockmatch || e.dataset.testid || '',
           text: own.slice(0, 160),
           full: norm(e.innerText || e.textContent).slice(0, 160),
           alt: img ? (e.getAttribute('alt') || e.getAttribute('aria-label') || (e.getAttribute('src') || '').split('/').pop().split('?')[0] || '') : '',
@@ -607,7 +607,7 @@ def report_change(page, before_url, before_texts, max_lines=8):
     added = [t for t in after if t not in bs]
     gone = [t for t in before_texts if t not in as_]
     if page.url != before_url and len(added) + len(gone) > max_lines:
-        out(f"new page: {len(added)} texts appeared, {len(gone)} went away (cdpm ui)")
+        out(f"new page: {len(added)} texts appeared, {len(gone)} went away (mockmatch ui)")
         return
     if not added and not gone and page.url == before_url:
         out("no visible change")
@@ -625,9 +625,9 @@ def report_change(page, before_url, before_texts, max_lines=8):
 def resolve(page, target):
     if target.startswith("@"):
         ref = target[1:]
-        loc = page.locator(f'[data-cdpm-ref="{ref}"]')
+        loc = page.locator(f'[data-mockmatch-ref="{ref}"]')
         if loc.count() == 0:
-            die(f"{target} is gone: refs change after every ui; run cdpm ui again", 1)
+            die(f"{target} is gone: refs change after every ui; run mockmatch ui again", 1)
         return loc.first, target
     if target.startswith("css="):
         loc = page.locator(target[4:])
@@ -642,8 +642,8 @@ def resolve(page, target):
                 return loc.first, target
         except Exception:
             pass
-        die(f"not found on the page: {target!r} (cdpm ui --find …)", 1)
-    return page.locator(f'[data-cdpm-ref="{r["ref"]}"]').first, f'{r["role"]} "{r["name"]}"'
+        die(f"not found on the page: {target!r} (mockmatch ui --find …)", 1)
+    return page.locator(f'[data-mockmatch-ref="{r["ref"]}"]').first, f'{r["role"]} "{r["name"]}"'
 
 
 def wait_text(page, text, timeout):
@@ -735,7 +735,7 @@ def act_goto(sess, url):
     out(f"{status} {page_head(page)}")
     errs = recent_errors(since=time.time() - 30)
     if errs:
-        out(f"! {len(errs)} console errors (cdpm log)")
+        out(f"! {len(errs)} console errors (mockmatch log)")
     return status == "?" or int(status) < 400
 
 
@@ -793,13 +793,13 @@ def set_view(w, h, theme):
         cur = load_session() or {}
         if cur.get("applied") == cur.get("rev"):
             return
-    die("the browser did not apply the new viewport; try cdpm close")
+    die("the browser did not apply the new viewport; try mockmatch close")
 
 
 def cmd_view(a):
     s = load_session()
     if not s or not alive(s.get("pid")):
-        die("no browser: start one with cdpm open <url>")
+        die("no browser: start one with mockmatch open <url>")
     w, h = parse_size(a.size) if a.size else (s["width"], s["height"])
     set_view(w, h, a.theme or s.get("theme"))
     out(f"viewport {w}x{h}, theme {a.theme or s.get('theme')}")
@@ -1709,7 +1709,7 @@ def cmd_compare(a):
                     load_static(pd, a.design, a.frame)
                     ed = run_js(pd, JS_EXTRACT, {"frame": a.frame, "props": STYLE_PROPS})
                     if ed.get("error"):
-                        die(ed["error"] + " (cdpm frames <design> lists them)")
+                        die(ed["error"] + " (mockmatch frames <design> lists them)")
                     fw = ed["frame"]["w"]
                     if width is None and a.frame:
                         width = fw
@@ -1855,7 +1855,7 @@ def build_board(run):
         notes = open(np_).read()
     e = html.escape
     parts = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-             f"<title>cdpm {e(os.path.basename(run))}</title><style>{BOARD_CSS}</style></head><body>",
+             f"<title>mockmatch {e(os.path.basename(run))}</title><style>{BOARD_CSS}</style></head><body>",
              f"<header><h1>Design vs site</h1><div class='mut'>design {e(rep['design'])}"
              f"{' frame ' + e(rep['frame']) if rep.get('frame') else ''} · site {e(rep['site'])} · {e(rep['created'])}</div></header>"]
     if notes:
@@ -1978,7 +1978,7 @@ def cmd_clean(a):
 
 def cmd_doctor(a):
     ok = True
-    out(f"cdpm {VERSION}, python {sys.version.split()[0]} ({sys.executable})")
+    out(f"mockmatch {VERSION}, python {sys.version.split()[0]} ({sys.executable})")
 
     def has(mod):
         try:
@@ -1998,7 +1998,7 @@ def cmd_doctor(a):
             subprocess.run([sys.executable, "-m", "venv", VENV], check=True)
         subprocess.run([VENV_PY, "-m", "pip", "install", "-q", "--upgrade", "pip", "playwright", "pillow"], check=True)
         py, pw, pil = VENV_PY, True, True
-    out(f"playwright: {'ok' if pw else 'MISSING'}   pillow: {'ok' if pil else 'MISSING'}   python for cdpm: {py}")
+    out(f"playwright: {'ok' if pw else 'MISSING'}   pillow: {'ok' if pil else 'MISSING'}   python for mockmatch: {py}")
     ok = pw and pil
     if pw:
         r = subprocess.run([py, "-c", "from playwright.sync_api import sync_playwright\n"
@@ -2013,23 +2013,23 @@ def cmd_doctor(a):
             out(f"chromium: {r.stdout.strip()}")
         else:
             ok = False
-            out("chromium: MISSING (cdpm doctor --install)")
-    out(f"project: {project_root()}  runs: {rel(os.path.join(project_root(), 'build', 'cdpm'))}")
+            out("chromium: MISSING (mockmatch doctor --install)")
+    out(f"project: {project_root()}  runs: {rel(os.path.join(project_root(), 'build', 'mockmatch'))}")
     gi = os.path.join(project_root(), ".gitignore")
     if os.path.exists(os.path.join(project_root(), ".git")):
-        r = subprocess.run(["git", "-C", project_root(), "check-ignore", "-q", "build/cdpm/x"])
+        r = subprocess.run(["git", "-C", project_root(), "check-ignore", "-q", "build/mockmatch/x"])
         if r.returncode != 0:
-            out(f"! build/cdpm is not ignored by git: add 'build/' to {rel(gi)}")
+            out(f"! build/mockmatch is not ignored by git: add 'build/' to {rel(gi)}")
     if not ok and not a.install:
-        out("run: cdpm doctor --install")
+        out("run: mockmatch doctor --install")
     return 0 if ok else 1
 
 
 # --- CLI -------------------------------------------------------------------------------------
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="cdpm", description="Deterministic browser control and design checks for an agent.")
-    p.add_argument("--version", action="version", version=f"cdpm {VERSION}")
+    p = argparse.ArgumentParser(prog="mockmatch", description="Deterministic browser control and design checks for an agent.")
+    p.add_argument("--version", action="version", version=f"mockmatch {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add(name, fn, help_, aliases=()):
@@ -2135,7 +2135,7 @@ def main(argv=None):
 
     sp = add("compare", cmd_compare, "check the site against the design: styles, geometry, pixels")
     sp.add_argument("--design", required=True, help="design URL or HTML file")
-    sp.add_argument("--frame", help="CSS selector of the design frame (cdpm frames)")
+    sp.add_argument("--frame", help="CSS selector of the design frame (mockmatch frames)")
     sp.add_argument("--site", help="site URL; without it, the current tab of the running browser")
     sp.add_argument("--site-frame", help="CSS selector of the compared part of the site")
     sp.add_argument("--width", help="viewport widths, comma-separated; default the frame width")

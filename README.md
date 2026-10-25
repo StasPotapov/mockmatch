@@ -1,8 +1,8 @@
-# CDPM — Chrome DevTools Protocol Matrix
+# mockmatch
 
 [Русский](README.ru.md)
 
-A [Claude Code](https://code.claude.com/docs/en/overview) [skill](https://code.claude.com/docs/en/skills) and the `cdpm` CLI:
+A [Claude Code](https://code.claude.com/docs/en/overview) [skill](https://code.claude.com/docs/en/skills) and the `mockmatch` CLI:
 an agent builds a website, drives a headless browser with deterministic commands and checks the
 result against the design — a [Claude Design](https://claude.ai/design) frame, an HTML mockup or a PNG.
 The agent reads lines of text, not screenshots. A sibling of [adbm](https://github.com/StasPotapov/adbm),
@@ -11,18 +11,18 @@ which does the same for Android.
 ## Why
 
 - **Deterministic.** Python scripts read the page and compare it with the design, not a model looking
-  at a screenshot. `cdpm click "Sign in" --expect "Dashboard"` finds the element by text, clicks it,
+  at a screenshot. `mockmatch click "Sign in" --expect "Dashboard"` finds the element by text, clicks it,
   reports which texts appeared and went away, and checks the next page. The same command on the same
   page gives the same answer.
-- **The design check is numbers.** `cdpm compare` renders the design and the site at the same width and
+- **The design check is numbers.** `mockmatch compare` renders the design and the site at the same width and
   pairs their elements. Then it lists what differs: `h1 "Build sites…"  font-size 48→40`,
   `missing a "Docs"`, `div box "Card"  padding 20→16  (+2 inside moved)`. The agent fixes CSS from these lines
   and runs the check again. It does not squint at two screenshots.
 - **A model where a script cannot help.** Pixel regions that the element lines do not explain (icons,
-  images, gradients) become small "design | site" crops. The `cdpm-eyes` subagent on a cheap model looks
+  images, gradients) become small "design | site" crops. The `mockmatch-eyes` subagent on a cheap model looks
   at them and writes a verdict.
 - **Fewer tokens.** A 1280×900 screenshot costs a model ~1500 tokens, a 1280×3000 page ~5000.
-  `cdpm ui` shows a simple page in ~150 tokens and a busy one in ~1500 (capped by `--max`); a `compare` report is 20–40 lines.
+  `mockmatch ui` shows a simple page in ~150 tokens and a busy one in ~1500 (capped by `--max`); a `compare` report is 20–40 lines.
 - **Easier for you to check.** One HTML board per run: the summary, the verdict, the element lines,
   a "design ◀ ▶ site" swipe view, the diff overlay and the crops.
 
@@ -35,22 +35,22 @@ which does the same for Android.
   `style` (computed styles), `eval`, `look` (a 640 px screenshot for the agent), `shot` (full size, for you).
 - **Design sources.** `pull` saves a rendered Claude Design file locally, without its access token.
   `frames` lists the options of a Claude Design canvas with a ready `--frame` selector.
-- **Design check.** `compare` pairs elements by `data-cdpm`, exact text, then similar text and position.
+- **Design check.** `compare` pairs elements by `data-mockmatch`, exact text, then similar text and position.
   For each pair it compares font family, size, weight, line height, letter spacing, color, background,
   border, radius, shadow, padding, opacity, size, x, and the gap to the element above. Then it runs a
   pixel diff with regions and crops. It runs several widths (`--width 1440,390`) and themes
   (`--theme light,dark`), against a fresh URL or the live tab with its state.
-- **Verdict and board.** `cdpm-eyes` reads only the crops and writes MATCH / PROBLEM / REVIEW into
+- **Verdict and board.** `mockmatch-eyes` reads only the crops and writes MATCH / PROBLEM / REVIEW into
   `notes.md`. `board` builds the HTML page.
-- **Accounting.** `status` shows calls, tokens `cdpm` put into the context and a rough estimate of
+- **Accounting.** `status` shows calls, tokens `mockmatch` put into the context and a rough estimate of
   tokens saved.
 
 ## How a design check goes
 
 1. **Design.** The agent gets a preview URL of the Claude Design file (`render_preview` of the
-   `claude_design` MCP), saves it with `cdpm pull` and picks the option with `cdpm frames`.
-2. **Site.** `cdpm open http://localhost:5173` — the dev server's page, as text.
-3. **Compare.** `cdpm compare --design design/page.html --frame '[id="1b"] .dv-card'` prints the lines:
+   `claude_design` MCP), saves it with `mockmatch pull` and picks the option with `mockmatch frames`.
+2. **Site.** `mockmatch open http://localhost:5173` — the dev server's page, as text.
+3. **Compare.** `mockmatch compare --design design/page.html --frame '[id="1b"] .dv-card'` prints the lines:
 
    ```
    == 960: 16/17 matched, 1 missing, 1 extra, 8 differ (8 major), match 47%, pixels 10.9%
@@ -60,11 +60,11 @@ which does the same for Android.
    ```
 
 4. **Fix and repeat** until no `!` lines remain.
-5. **Verdict.** `cdpm-eyes` judges the remaining pixel regions; `cdpm board` gives you the page.
+5. **Verdict.** `mockmatch-eyes` judges the remaining pixel regions; `mockmatch board` gives you the page.
 
 ## Built on
 
-| Tool | License | What it does in CDPM |
+| Tool | License | What it does in mockmatch |
 |---|---|---|
 | [Playwright for Python](https://playwright.dev/python/) | Apache 2.0 | launches Chromium, connects over the Chrome DevTools Protocol, screenshots |
 | [Chromium](https://www.chromium.org) (downloaded by Playwright) | BSD-style | renders the design and the site |
@@ -78,22 +78,22 @@ Requires Python 3.9+. macOS is tested; Linux should work.
 
 ```
 /plugin marketplace add StasPotapov/sp-tools
-/plugin install cdpm@sp-tools
+/plugin install mockmatch@sp-tools
 ```
 
-The skill is then called `/cdpm:cdpm`. Then ask the agent to run `cdpm doctor --install`: it creates a venv
-with Playwright, Pillow and Chromium in `~/.local/share/cdpm`, outside the plugin cache, so updates keep it.
-To get a new version: `/plugin marketplace update sp-tools`, then `claude plugin update cdpm@sp-tools`
+The skill is then called `/mockmatch:mockmatch`. Then ask the agent to run `mockmatch doctor --install`: it creates a venv
+with Playwright, Pillow and Chromium in `~/.local/share/mockmatch`, outside the plugin cache, so updates keep it.
+To get a new version: `/plugin marketplace update sp-tools`, then `claude plugin update mockmatch@sp-tools`
 (in the shell).
 
 **From a clone.** Pick one way: with both, the skill and the hook load twice.
 The skill and the agent are symlinks; the hook goes into `~/.claude/settings.json`.
 
 ```bash
-git clone https://github.com/StasPotapov/cdpm.git ~/dev/cdpm
-ln -s ~/dev/cdpm/skill ~/.claude/skills/cdpm
-ln -s ~/dev/cdpm/skill/agents/cdpm-eyes.md ~/.claude/agents/cdpm-eyes.md
-~/dev/cdpm/skill/bin/cdpm doctor --install   # venv with Playwright, Pillow, Chromium in ~/.local/share/cdpm
+git clone https://github.com/StasPotapov/mockmatch.git ~/dev/mockmatch
+ln -s ~/dev/mockmatch/skill ~/.claude/skills/mockmatch
+ln -s ~/dev/mockmatch/skill/agents/mockmatch-eyes.md ~/.claude/agents/mockmatch-eyes.md
+~/dev/mockmatch/skill/bin/mockmatch doctor --install   # venv with Playwright, Pillow, Chromium in ~/.local/share/mockmatch
 ```
 
 The guard hook denies the agent reading full-size screenshots. Add it to `~/.claude/settings.json`
@@ -101,17 +101,17 @@ under `hooks.PreToolUse`:
 
 ```json
 { "matcher": "Read", "hooks": [{ "type": "command",
-  "command": "f=~/.claude/skills/cdpm/hooks/cdpm-guard.py; [ -f \"$f\" ] || exit 0; exec python3 \"$f\"" }] }
+  "command": "f=~/.claude/skills/mockmatch/hooks/mockmatch-guard.py; [ -f \"$f\" ] || exit 0; exec python3 \"$f\"" }] }
 ```
 
-`build/cdpm/` in the project holds runs, screenshots and the browser state: add `build/` to `.gitignore`.
-`cdpm doctor` warns when it is not ignored.
+`build/mockmatch/` in the project holds runs, screenshots and the browser state: add `build/` to `.gitignore`.
+`mockmatch doctor` warns when it is not ignored.
 
 ## Tests
 
 ```bash
-~/.local/share/cdpm/venv/bin/pip install pytest
-~/.local/share/cdpm/venv/bin/python -m pytest tests -q
+~/.local/share/mockmatch/venv/bin/pip install pytest
+~/.local/share/mockmatch/venv/bin/python -m pytest tests -q
 ```
 
 Unit tests cover color and style parsing, matching, folding and the hook; browser tests run `compare`
@@ -119,13 +119,13 @@ on `tests/fixtures/` and drive the session.
 
 ## Files
 
-- `skill/SKILL.md` — the skill: when and how the agent uses `cdpm`.
-- `skill/bin/cdpm` — the CLI, one Python file.
+- `skill/SKILL.md` — the skill: when and how the agent uses `mockmatch`.
+- `skill/bin/mockmatch` — the CLI, one Python file.
 - `skill/reference/design-check.md` — `compare` in detail; `troubleshooting.md` — symptoms and fixes.
-- `skill/agents/cdpm-eyes.md` — the verdict subagent.
+- `skill/agents/mockmatch-eyes.md` — the verdict subagent.
 - `skill/hooks/` — the guard hook and its plugin config.
 - `tests/` — pytest and HTML fixtures.
-- `docs/alternatives.md` — similar tools and why cdpm exists ([Russian](docs/alternatives.ru.md)).
+- `docs/alternatives.md` — similar tools and why mockmatch exists ([Russian](docs/alternatives.ru.md)).
 
 ## License
 

@@ -64,9 +64,11 @@ did nothing visible.
 Read `reference/design-check.md` before the first `compare` in a session. The short path:
 
 1. **Get the design.** Find where it lives, in this order:
-   - `design/design.json` (written by `pull`) has `claude_design` — the project and file of an earlier
-     pull. Refresh from them: the person may have changed the design since.
+   - `design/design.json` (written by `pull` or `import`) has `claude_design` or `artifact` — where the
+     copy came from. Refresh from there: the person may have changed the design since.
    - The person gave a Claude Design link `claude.ai/design/p/<id>?file=…` — the project id and file.
+   - The person gave a `claude.ai/artifact/…` link, or the design is a claude.ai artifact of type
+     "Design" (`Artifact` with `action: "list", type: "Design"`) — see "A Design artifact" below.
    - The task or the spec names a design file in the repository (an HTML mockup or a PNG) — use it as is.
    - Otherwise `mcp__claude_design__list_projects`, then `list_files`; ask the person which project
      and file if it is not clear.
@@ -80,6 +82,18 @@ Read `reference/design-check.md` before the first `compare` in a session. The sh
    `pull "<serve_url>" --out design --project <project_id> --file "<path>"` saves it without the token and
    keeps the project and file in `design/design.json` for the next refresh. Never write the `serve_url`
    into files or show it to the person; the link for the person is `open_url`.
+   **A Design artifact** is not in Claude Design: the `claude_design` MCP does not see it. Its screens
+   are `project/<Screen>.dc.html`, their titles and sizes are in `project/canvas.json`.
+   1. `Artifact` `action: "read"`, `url`, `paths: ["project/canvas.json", "project/<Screen>.dc.html", …]`
+      — only the screens you need, `out_dir: <tmp folder>`. No `prompt`: with `path`/`paths` the tool
+      refuses it. Note the version from the result.
+   2. `import <tmp folder> --artifact <url> --version <version>` copies them to `design/` without scripts.
+   3. `! N images missing … path=<id>` — read each with `Artifact` `read`, `path: "<id>"`, the same
+      `out_dir`, then `import` again.
+
+   The `Artifact` tool exists only in an interactive session, not in `claude -p`. Commit `design/`:
+   an unattended check compares with that copy.
+
 2. **Pick the frame.** `frames design/<file>.html` lists the canvas options with sizes and a `--frame`
    selector. Ask the person which option is the one to build if it is not clear.
 3. **Compare.** With the site open in the browser (`open …`):

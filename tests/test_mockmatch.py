@@ -221,3 +221,25 @@ def test_pull_keeps_claude_design_source(tmp_path):
                   "url": "https://claude.ai/design/p/abcdef12-0000?file=Other.dc.html"}
     A.project, A.file = "https://claude.ai/design/p/abcdef12-0000?file=%D0%9E+x.dc.html", None
     assert mockmatch.claude_design_source(A, str(out), "o.html")["file"] == "О x.dc.html"
+
+
+def test_import_artifact_files(tmp_path):
+    src = tmp_path / "read" / "project"
+    src.mkdir(parents=True)
+    blob = "f2c35a1cae9977131fcdf99eef6d321b"
+    other = "0" * 32
+    (src / "Login.dc.html").write_text(
+        f'<html><head><script src="./support.js"></script></head><body><x-dc><img src="/_blob/{blob}">'
+        f'<img src="/_blob/{other}"></x-dc><script type="text/x-dc">class C {{}}</script></body></html>')
+    (src / "canvas.json").write_text(json.dumps({"boards": {"Login.dc.html": {"title": "Вход", "w": 1440, "h": 1000}}}))
+    (tmp_path / "read" / "blobs").mkdir()
+    (tmp_path / "read" / "blobs" / f"{blob}.svg").write_text("<svg/>")
+    out = tmp_path / "design"
+    r = subprocess.run([sys.executable, CLI, "import", str(tmp_path / "read"), "--artifact", "https://claude.ai/artifact/X",
+                        "--out", str(out)], capture_output=True, text=True, env={**os.environ, "MOCKMATCH_PROJECT": str(tmp_path)})
+    assert r.returncode == 1 and f"path={other}" in r.stdout
+    doc = (out / "Login.dc.html").read_text()
+    assert "<script" not in doc and f'src="assets/{blob}.svg"' in doc and (out / "assets" / f"{blob}.svg").exists()
+    meta = json.loads((out / "design.json").read_text())
+    assert meta["artifact"]["boards"]["Login.dc.html"] == {"title": "Вход", "w": 1440, "h": 1000}
+    assert meta["files"] == ["Login.dc.html"] and "claude_design" not in meta

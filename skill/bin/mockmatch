@@ -1239,9 +1239,14 @@ def cmd_frames(a):
         load_static(pg, a.design)
         r = pg.evaluate(JS_FRAMES)
         b.close()
-    cd = (design_meta(a.design) or {}).get("claude_design")
+    meta = design_meta(a.design) or {}
+    cd, art = meta.get("claude_design"), meta.get("artifact")
     if cd:
-        out(f"source: Claude Design project {cd['project']}  file {cd['file']}  pulled {design_meta(a.design).get('pulled')}")
+        out(f"source: Claude Design project {cd['project']}  file {cd['file']}  pulled {meta.get('pulled')}")
+    elif art:
+        board = art.get("boards", {}).get(os.path.basename(a.design), {})
+        out(f"source: artifact {art['url']}  file project/{os.path.basename(a.design)}"
+            + (f"  \"{board['title']}\" {board['w']}x{board['h']}" if board else "") + f"  imported {art.get('imported')}")
     if r["canvas"]:
         out(f"Claude Design canvas: {len(r['frames'])} frames")
     for f in r["frames"]:
@@ -1352,6 +1357,78 @@ def claude_design_source(a, out_dir, name):
     if name in old.get("files", [])[:1]:
         return old.get("claude_design")
     return None
+
+
+BLOB = re.compile(r"/_blob/([0-9a-f]{32})")
+
+
+def cmd_import(a):
+    """Takes the files of a claude.ai Design artifact that `Artifact read` saved (project/*.dc.html,
+    project/canvas.json, assets by id) into the design folder: scripts removed, /_blob/<id> images
+    pointed at local copies, the artifact URL and the board titles and sizes kept in design.json."""
+    src = os.path.abspath(a.src)
+    if not os.path.isdir(src):
+        die(f"no folder {a.src}")
+    pages, blobs, canvas = [], {}, None
+    for root, _, files in os.walk(src):
+        for f in files:
+            path = os.path.join(root, f)
+            if f.endswith(".dc.html") or (f.endswith(".html") and a.all_html):
+                pages.append(path)
+            elif f == "canvas.json":
+                canvas = path
+            elif re.fullmatch(r"[0-9a-f]{32}\.\w+", f):
+                blobs[f.split(".")[0]] = path
+    if not pages:
+        die(f"no .dc.html files in {a.src}: read project/<Screen>.dc.html of the artifact into it first")
+    out_dir = os.path.abspath(a.out)
+    os.makedirs(os.path.join(out_dir, "assets"), exist_ok=True)
+    meta = design_meta(os.path.join(out_dir, "x")) or {}
+    art = meta.get("artifact") if (meta.get("artifact") or {}).get("url") == a.artifact else None
+    art = art or {"url": a.artifact, "boards": {}}
+    if canvas:
+        try:
+            with open(canvas) as f:
+                for name, b in (json.load(f).get("boards") or {}).items():
+                    art["boards"][name] = {k: b.get(k) for k in ("title", "w", "h")}
+        except (OSError, ValueError):
+            pass
+    missing, used = set(), set()
+    for path in sorted(pages):
+        with open(path, encoding="utf-8") as f:
+            doc = f.read()
+        doc = re.sub(r"<script\b[^>]*>.*?</script>", "", doc, flags=re.S | re.I)
+
+        def local(m):
+            bid = m.group(1)
+            if bid not in blobs:
+                missing.add(bid)
+                return m.group(0)
+            name = os.path.basename(blobs[bid])
+            used.add(bid)
+            return "assets/" + name
+        doc = BLOB.sub(local, doc)
+        with open(os.path.join(out_dir, os.path.basename(path)), "w", encoding="utf-8") as f:
+            f.write(doc)
+    for bid in used:
+        shutil.copy(blobs[bid], os.path.join(out_dir, "assets", os.path.basename(blobs[bid])))
+    art["imported"] = dt.datetime.now().isoformat(timespec="seconds")
+    if a.version:
+        art["version"] = a.version
+    names = sorted({*meta.get("files", []), *(os.path.basename(p) for p in pages)})
+    meta.update({"source": a.artifact, "pulled": art["imported"], "files": names, "artifact": art})
+    meta.pop("claude_design", None)
+    with open(os.path.join(out_dir, "design.json"), "w") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=1)
+    out(f"imported {len(pages)} files -> {rel(out_dir)} (+{len(used)} images, scripts removed)")
+    for p in sorted(pages)[:a.lines]:
+        b = art["boards"].get(os.path.basename(p))
+        out(f"  {rel(os.path.join(out_dir, os.path.basename(p)))}" + (f"  {b['w']}x{b['h']}  {b['title']}" if b else ""))
+    if missing:
+        out(f"! {len(missing)} images missing — read them as assets and import again: "
+            + " ".join(f"path={m}" for m in sorted(missing)))
+        return 1
+    return 0
 
 
 # --- compare: design vs site -----------------------------------------------------------------
@@ -2208,6 +2285,14 @@ def main(argv=None):
     sp.add_argument("--name")
     sp.add_argument("--project", help="Claude Design project id or its claude.ai/design/p/<id>?file=… link, kept in design.json")
     sp.add_argument("--file", help="the file path inside the Claude Design project, kept in design.json")
+
+    sp = add("import", cmd_import, "take a claude.ai Design artifact's files (saved by Artifact read) into the design folder")
+    sp.add_argument("src", help="the folder Artifact read saved the files to")
+    sp.add_argument("--artifact", required=True, help="the artifact URL, kept in design.json")
+    sp.add_argument("--out", default="design")
+    sp.add_argument("--version", help="the artifact version from the read result, kept in design.json")
+    sp.add_argument("--all-html", action="store_true", help="also plain .html files, not only .dc.html")
+    sp.add_argument("--lines", type=int, default=40)
 
     sp = add("compare", cmd_compare, "check the site against the design: styles, geometry, pixels")
     sp.add_argument("--design", required=True, help="design URL or HTML file")

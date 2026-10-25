@@ -35,6 +35,7 @@ which does the same for Android.
   `style` (computed styles), `eval`, `look` (a 640 px screenshot for the agent), `shot` (full size, for you).
 - **Design sources.** `pull` saves a rendered Claude Design file locally, without its access token, and
   remembers its project and file in `design/design.json`, so the next check refreshes it from the same place.
+  `import` does the same for a claude.ai artifact of type "Design" after the agent reads its files.
   `frames` lists the options of a Claude Design canvas with a ready `--frame` selector.
 - **Design check.** `compare` pairs elements by `data-mockmatch`, exact text, then similar text and position.
   For each pair it compares font family, size, weight, line height, letter spacing, color, background,

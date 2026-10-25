@@ -17,6 +17,7 @@ and the frame snapped to whole pixels. Then it does two passes:
 | Source | How |
 |---|---|
 | Claude Design | `render_preview(project_id, path)` (MCP `claude_design`) → `serve_url`, then `mockmatch pull "<serve_url>" --out design --project <project_id> --file "<path>"`. The URL holds a token and lives ~1 hour: do not write it into files, do not show it. `pull` saves the rendered page without scripts and the token; commit `design/` so the check repeats without the MCP. |
+| claude.ai Design artifact | `Artifact` `read` with `paths` (`project/canvas.json`, `project/<Screen>.dc.html`; no `prompt`) into a temp folder, then `mockmatch import <folder> --artifact <url> --version <v>`. Missing images (`path=<id>`) are read as assets into the same folder; `import` again. Interactive sessions only: `claude -p` has no `Artifact` tool. |
 | HTML mockup in the repo | `--design path/to/mockup.html` as is |
 | A live URL | `--design https://…` (for example the old version of the site) |
 | PNG / JPG | `--design mock.png`: pixels only, no element lines; the viewport width is the image width |
@@ -28,6 +29,15 @@ the file path and the editor link (`url`, safe to show). A later `pull` into the
 keeps it. `mockmatch frames design/<file>.html` prints it as the `source:` line. To refresh the copy, call
 `render_preview` with that project and file and `pull` again. A project link from the person
 (`claude.ai/design/p/<id>?file=…`) works as `--project` as is: the file is taken from `file=`.
+
+### A Design artifact
+
+A claude.ai artifact of type "Design" is another place for designs, separate from Claude Design.
+Each screen is its own file `project/<Screen>.dc.html` (`-phone` for 390 px, `-dark` for the dark
+theme); `project/canvas.json` holds their titles and sizes. `import` removes the scripts, points
+`/_blob/<id>` images at `design/assets/`, and writes `artifact` into `design.json`: the URL, the
+version and the boards. `frames design/<Screen>.dc.html` prints the source and the board title.
+A screen file has one frame, `body`, at the board width.
 
 ### Login
 

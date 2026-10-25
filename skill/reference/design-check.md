@@ -102,7 +102,7 @@ the `mockmatch-eyes` subagent (Agent tool, `subagent_type: mockmatch-eyes`) with
 
 - **Task** — what the page is and what was built.
 - **Run** — `build/mockmatch/<run>` from the last line of `compare`.
-- **mockmatch** — the full path to the CLI.
+- **MOCKMATCH** — the full path to the CLI.
 - **Lines** — the `compare` output.
 
 It reads only the crops, writes `notes.md` with MATCH / PROBLEM / REVIEW per region and rebuilds the

@@ -16,7 +16,7 @@ must change in the site.
 
 - **Task** — what the page is and what was built.
 - **Run** — the path to the `build/mockmatch/<run>/` folder.
-- **mockmatch** — the path to the `mockmatch` CLI.
+- **MOCKMATCH** — the path to the `mockmatch` CLI.
 - **Lines** — the `mockmatch compare` output: element lines (`design → site`) and pixel regions `r1…rN`.
 
 ## Image budget
@@ -29,7 +29,7 @@ Open images in this order and stop as soon as you can decide:
    A magenta strip separates them, magenta fill means the other image ends there.
 2. **Overlay** `<run>/<cell>/diff/overlay.png` — the site, dimmed, changed pixels red, regions in blue boxes.
    Only when you need to see where regions are on the page.
-3. **`"$mockmatch" thumb <image> --crop x0,y0,x1,y1`** — a 1:1 crop of `<cell>/design.png` or `<cell>/site.png`.
+3. **`"$MOCKMATCH" thumb <image> --crop x0,y0,x1,y1`** — a 1:1 crop of `<cell>/design.png` or `<cell>/site.png`.
    Coordinates are the frame pixels from the lines. Open the file it prints.
 
 At most 8 images per run. Never open `design.png` or `site.png` directly: they are full size.
@@ -61,5 +61,5 @@ REVIEW r7 (1280): the chart bars are a different height — data or layout? Chec
 Summary: 1 PROBLEM, 1 REVIEW, 1 MATCH.
 ```
 
-One line per region, `(cell)` after the region name. Then run `"$mockmatch" board <run>` so the board shows
+One line per region, `(cell)` after the region name. Then run `"$MOCKMATCH" board <run>` so the board shows
 the verdict. Your answer to the main agent: the same lines, nothing else — at most 12 lines.

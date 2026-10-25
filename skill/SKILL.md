@@ -27,10 +27,10 @@ It has two layers:
 - **Design check.** `compare` matches the site against a design frame element by element, then pixel
   by pixel, writes a run folder with an HTML board, and the `mockmatch-eyes` subagent judges the crops.
 
-The CLI is `bin/mockmatch` of this skill: `mockmatch="${CLAUDE_SKILL_DIR}/bin/mockmatch"`. If the variable is not
+The CLI is `bin/mockmatch` of this skill: `MOCKMATCH="${CLAUDE_SKILL_DIR}/bin/mockmatch"`. If the variable is not
 substituted, take the folder from the "Base directory for this skill" line. Run commands from the
 project root: files go to `<project>/build/mockmatch/`. The project is the git root of the current folder;
-`MOCKMATCH_PROJECT=<path>` overrides it. Help: `"$mockmatch" <command> -h`. Commands below omit the prefix; set the
+`MOCKMATCH_PROJECT=<path>` overrides it. Help: `"$MOCKMATCH" <command> -h`. Commands below omit the prefix; set the
 variable in every Bash call (it does not persist). First use on a machine: `doctor`, and if it reports
 something missing, `doctor --install` (a private venv with Playwright, Chromium and Pillow).
 

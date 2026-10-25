@@ -198,6 +198,8 @@ def test_claude_design_status_parsing():
     state, msg = mockmatch.parse_mcp_status(1, gone)
     assert state == "missing" and "claude mcp add" in msg
     assert mockmatch.parse_mcp_status(0, "  Status: ✗ Failed to connect\n")[0] == "failed"
+    state, msg = mockmatch.parse_mcp_status(0, "claude_design:\n  Status: ✘ Failed to connect\n  Issue: api.anthropic.com rejected your claude.ai login (HTTP 403). Run /x-login and retry.\n")
+    assert state == "auth" and "Run /x-login" in msg
 
 
 def test_design_project_id():

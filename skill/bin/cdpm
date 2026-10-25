@@ -2014,7 +2014,7 @@ def cmd_doctor(a):
         else:
             ok = False
             out("chromium: MISSING (cdpm doctor --install)")
-    out(f"project: {project_root()}  runs: {rel(cache_dir())}")
+    out(f"project: {project_root()}  runs: {rel(os.path.join(project_root(), 'build', 'cdpm'))}")
     gi = os.path.join(project_root(), ".gitignore")
     if os.path.exists(os.path.join(project_root(), ".git")):
         r = subprocess.run(["git", "-C", project_root(), "check-ignore", "-q", "build/cdpm/x"])

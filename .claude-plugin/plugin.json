@@ -1,0 +1,24 @@
+{
+  "name": "cdpm",
+  "version": "0.1.0",
+  "description": "Chrome DevTools Protocol Matrix: an agent drives a headless browser with deterministic commands instead of guesses from screenshots — the page as text, clicks that report what changed, input, console errors, computed styles — and checks the site against the design (a Claude Design frame, an HTML mockup or a PNG): element-by-element style and geometry diff, pixel regions with crops, an HTML board and a subagent verdict.",
+  "author": {
+    "name": "Stas Potapov"
+  },
+  "license": "MIT",
+  "keywords": [
+    "browser",
+    "playwright",
+    "chrome-devtools-protocol",
+    "design",
+    "visual-testing",
+    "claude-design"
+  ],
+  "skills": [
+    "./skill/"
+  ],
+  "agents": [
+    "./skill/agents/cdpm-eyes.md"
+  ],
+  "hooks": "./skill/hooks/hooks.json"
+}

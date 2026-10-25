@@ -1,0 +1,12 @@
+{
+  "name": "cdpm",
+  "description": "CDPM: browser control and design-vs-site checks for Claude Code",
+  "owner": { "name": "Stas Potapov" },
+  "plugins": [
+    {
+      "name": "cdpm",
+      "source": "./",
+      "description": "Skill, cdpm CLI, cdpm-eyes subagent and the guard hook"
+    }
+  ]
+}

@@ -1,0 +1,2185 @@
+#!/usr/bin/env python3
+"""cdpm — Chrome DevTools Protocol Matrix.
+
+CLI for building a website as an agent: a headless Chromium kept alive between calls is driven
+with deterministic commands (the page as compact text, clicks by text that report what changed),
+and `compare` checks the site against a design (a Claude Design canvas frame, an HTML mockup or a
+PNG): computed styles and geometry element by element, then a pixel diff with regions and crops.
+Images do not enter the agent's context: the agent reads lines of text.
+
+Requirements: Python 3.9+, Playwright for Python with Chromium, Pillow.
+`cdpm doctor --install` puts them into a private venv (~/.local/share/cdpm/venv).
+"""
+import argparse
+import datetime as dt
+import difflib
+import html
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+
+VERSION = "0.1.0"
+HOME_DIR = os.path.expanduser(os.environ.get("CDPM_HOME", "~/.local/share/cdpm"))
+VENV = os.path.join(HOME_DIR, "venv")
+VENV_PY = os.path.join(VENV, "bin", "python")
+SELF = os.path.realpath(__file__)
+
+
+# --- bootstrap: run under the private venv when the system Python has no Playwright -----------
+
+def _bootstrap():
+    if os.environ.get("CDPM_NO_VENV") or len(sys.argv) > 1 and sys.argv[1] == "doctor":
+        return
+    try:
+        import playwright  # noqa: F401
+        import PIL  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.path.exists(VENV_PY) and os.path.realpath(sys.prefix) != os.path.realpath(VENV):
+        os.execv(VENV_PY, [VENV_PY, SELF] + sys.argv[1:])
+    sys.stderr.write("cdpm: Playwright or Pillow is missing. Run: cdpm doctor --install\n")
+    sys.exit(3)
+
+
+_bootstrap()
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+
+# --- output and token accounting -------------------------------------------------------------
+
+_OUT = []
+_IMAGES = 0
+
+
+def out(*parts):
+    line = " ".join(str(p) for p in parts)
+    _OUT.append(line)
+    print(line, flush=True)
+
+
+def die(msg, code=2):
+    out(f"cdpm: {msg}")
+    sys.exit(code)
+
+
+def est_tokens(text):
+    # Cyrillic costs more per character than Latin; bytes/4 is close enough for both.
+    return math.ceil(len(text.encode("utf-8")) / 4)
+
+
+def image_tokens(w, h):
+    return math.ceil(w * h / 750)
+
+
+def record_stats(cmd, saved=0):
+    try:
+        d = cache_dir()
+        with open(os.path.join(d, "stats.jsonl"), "a") as f:
+            f.write(json.dumps({"t": int(time.time()), "cmd": cmd, "tokens": est_tokens("\n".join(_OUT)),
+                                "images": _IMAGES, "saved": saved}) + "\n")
+    except Exception:
+        pass
+
+
+# --- project, runs, session ------------------------------------------------------------------
+
+def project_root():
+    p = os.environ.get("CDPM_PROJECT")
+    if p:
+        return os.path.abspath(p)
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return os.getcwd()
+
+
+def cache_dir():
+    d = os.path.join(project_root(), "build", "cdpm")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def rel(path):
+    try:
+        r = os.path.relpath(path, project_root())
+        return path if r.startswith("..") else r
+    except ValueError:
+        return path
+
+
+def slugify(s, n=24):
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s.lower()).strip("-")
+    return s[:n].strip("-") or "run"
+
+
+def new_run(name):
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    d = os.path.join(cache_dir(), f"{stamp}-{slugify(name)}")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(cache_dir(), "current"), "w") as f:
+        f.write(os.path.basename(d))
+    return d
+
+
+def find_run(name=None):
+    base = cache_dir()
+    if not name:
+        try:
+            name = open(os.path.join(base, "current")).read().strip()
+        except OSError:
+            die("no run yet: start one with cdpm compare")
+    if os.path.isdir(name):
+        return os.path.abspath(name)
+    cands = sorted(x for x in os.listdir(base) if os.path.isdir(os.path.join(base, x)) and name in x)
+    if not cands:
+        die(f"run not found: {name}")
+    return os.path.join(base, cands[-1])
+
+
+def session_path():
+    return os.path.join(cache_dir(), "session.json")
+
+
+def load_session():
+    try:
+        with open(session_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_session(s):
+    tmp = session_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=1)
+    os.replace(tmp, session_path())
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)(?:[x×](\d+))?", s.strip())
+    if not m:
+        die(f"bad size {s!r}: use WIDTH or WIDTHxHEIGHT")
+    w = int(m.group(1))
+    return w, int(m.group(2) or 900)
+
+
+# --- the browser daemon ----------------------------------------------------------------------
+# One headless Chromium per project lives in a background process. It owns the browser context
+# (viewport, theme, locale), records console messages and failed requests to files and applies
+# viewport/theme changes written to session.json. Commands connect over CDP, act and disconnect.
+
+STOP_ANIM_CSS = """*,*::before,*::after{transition:none!important;animation:none!important;
+caret-color:transparent!important;scroll-behavior:auto!important}"""
+
+
+def context_options(width, height, theme, locale, reduced=True):
+    return dict(viewport={"width": width, "height": height}, device_scale_factor=1,
+                color_scheme=theme or "light", locale=locale or "en-US", timezone_id="UTC",
+                reduced_motion="reduce" if reduced else "no-preference")
+
+
+def cmd_daemon(a):
+    from playwright.sync_api import sync_playwright
+    base = cache_dir()
+    logf = open(os.path.join(base, "console.jsonl"), "a")
+
+    def log(kind, **kw):
+        kw.update(t=round(time.time(), 3), kind=kind)
+        logf.write(json.dumps(kw, ensure_ascii=False) + "\n")
+        logf.flush()
+
+    s = load_session()
+    with sync_playwright() as p:
+        b = p.chromium.launch(args=[f"--remote-debugging-port={s['port']}"])
+        ctx = b.new_context(**context_options(s["width"], s["height"], s.get("theme"), s.get("locale")))
+        ctx.on("console", lambda m: log("console", level=m.type, text=m.text[:800],
+                                        src=(m.location or {}).get("url", "")[-80:]))
+        ctx.on("weberror", lambda e: log("pageerror", text=str(e.error)[:800]))
+        ctx.on("requestfailed", lambda r: log("netfail", url=r.url[:300], method=r.method,
+                                              error=(r.failure or "")[:200]))
+        ctx.on("response", lambda r: r.status >= 400 and log("http", url=r.url[:300], status=r.status))
+        ctx.new_page()
+        s.update(pid=os.getpid(), ready=True, applied=s.get("rev", 0))
+        save_session(s)
+        idle = float(os.environ.get("CDPM_IDLE_HOURS", "3")) * 3600
+        while True:
+            pages = ctx.pages
+            pg = pages[0] if pages else ctx.new_page()
+            pg.wait_for_timeout(400)
+            cur = load_session() or {}
+            if cur.get("stop"):
+                break
+            if time.time() - cur.get("used", time.time()) > idle:
+                break
+            if cur.get("rev", 0) != cur.get("applied", 0):
+                for q in ctx.pages:
+                    q.set_viewport_size({"width": cur["width"], "height": cur["height"]})
+                    q.emulate_media(color_scheme=cur.get("theme") or "light")
+                cur["applied"] = cur["rev"]
+                save_session(cur)
+        b.close()
+    try:
+        os.remove(session_path())
+    except OSError:
+        pass
+
+
+def start_daemon(width=1280, height=900, theme="light", locale="en-US"):
+    s = load_session()
+    if s and alive(s.get("pid")) and s.get("ready"):
+        return s
+    s = dict(port=free_port(), width=width, height=height, theme=theme, locale=locale,
+             rev=0, used=time.time(), started=dt.datetime.now().isoformat(timespec="seconds"))
+    save_session(s)
+    env = dict(os.environ, CDPM_PROJECT=project_root())
+    with open(os.path.join(cache_dir(), "daemon.log"), "a") as lf:
+        subprocess.Popen([sys.executable, SELF, "_daemon"], stdout=lf, stderr=lf, env=env,
+                         start_new_session=True, cwd=project_root())
+    for _ in range(150):
+        time.sleep(0.1)
+        s = load_session() or {}
+        if s.get("ready"):
+            return s
+    die("the browser did not start; see build/cdpm/daemon.log")
+
+
+class Session:
+    """Connects to the daemon's browser; `page` is the active tab."""
+
+    def __init__(self, need=True, pw=None):
+        from playwright.sync_api import sync_playwright
+        s = load_session()
+        if not s or not alive(s.get("pid")):
+            if need:
+                die("no browser: start one with cdpm open <url>")
+        self.s = s
+        self._own = pw is None
+        self._p = sync_playwright().start() if pw is None else pw
+        self.browser = self._p.chromium.connect_over_cdp(f"http://127.0.0.1:{s['port']}")
+        self.ctx = self.browser.contexts[0]
+        pages = self.ctx.pages
+        self.page = pages[min(s.get("tab", len(pages) - 1), len(pages) - 1)] if pages else self.ctx.new_page()
+        self.page.emulate_media(color_scheme=s.get("theme") or "light")
+        self.page.set_default_timeout(float(os.environ.get("CDPM_TIMEOUT", "8")) * 1000)
+        s["used"] = time.time()
+        save_session(s)
+
+    def close(self):
+        try:
+            if self._own:
+                self._p.stop()
+        except Exception:
+            pass
+
+
+# --- page reading (runs in the page) ---------------------------------------------------------
+
+JS_HELPERS = r"""
+const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+const INTER = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=checkbox],[role=radio],[role=menuitem],[role=switch],[role=option],[role=combobox],[contenteditable=true],[onclick]';
+const isVis = e => {
+  const s = getComputedStyle(e);
+  if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse' || +s.opacity === 0) return false;
+  const r = e.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+};
+const nameOf = e => {
+  const t = e.tagName;
+  let n = e.getAttribute('aria-label') || '';
+  if (!n && e.getAttribute('aria-labelledby')) {
+    n = e.getAttribute('aria-labelledby').split(/\s+/).map(i => (document.getElementById(i) || {}).innerText || '').join(' ');
+  }
+  if (!n && (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT')) {
+    if (e.labels && e.labels.length) n = e.labels[0].innerText;
+    n = n || e.getAttribute('placeholder') || e.getAttribute('name') || '';
+  }
+  if (!n) n = e.innerText || e.getAttribute('title') || e.getAttribute('alt') || '';
+  if (!n && t === 'A') n = e.getAttribute('href') || '';
+  if (!n) { const img = e.querySelector('img[alt],svg title'); if (img) n = img.getAttribute('alt') || img.textContent; }
+  return norm(n);
+};
+const roleOf = e => {
+  const r = e.getAttribute('role'); if (r) return r;
+  const t = e.tagName.toLowerCase();
+  if (t === 'a') return 'link';
+  if (t === 'input') { const ty = (e.type || 'text').toLowerCase(); return ty === 'submit' || ty === 'button' ? 'button' : ty === 'checkbox' ? 'checkbox' : ty === 'radio' ? 'radio' : 'input:' + ty; }
+  if (t === 'select') return 'select';
+  if (t === 'textarea') return 'textarea';
+  if (t === 'summary') return 'summary';
+  if (e.isContentEditable) return 'editable';
+  return t === 'button' ? 'button' : 'clickable';
+};
+const INLINE = new Set(['inline', 'inline-block']);
+const isTextBlock = e => {
+  if (!norm(e.innerText)) return false;
+  const d0 = getComputedStyle(e).display;
+  if (d0.startsWith('table') && d0 !== 'table-cell' && d0 !== 'table-caption') return false;
+  for (const c of e.children) {
+    if (c.tagName === 'BR') continue;
+    if (!isVis(c)) continue;
+    if (c.matches(INTER)) return false;
+    if (!INLINE.has(getComputedStyle(c).display)) return false;
+    if (c.children.length && !isTextBlock(c)) return false;
+  }
+  return true;
+};
+const ownText = e => norm([...e.childNodes].filter(c => c.nodeType === 3).map(c => c.textContent).join(' '));
+"""
+
+JS_UI = JS_HELPERS + r"""
+(opts) => {
+  const all = opts.all, max = opts.max, find = (opts.find || '').toLowerCase();
+  document.querySelectorAll('[data-cdpm-ref]').forEach(e => e.removeAttribute('data-cdpm-ref'));
+  const vh = innerHeight, vw = innerWidth;
+  const lines = []; let n = 0, below = 0, above = 0;
+  const LAND = {HEADER:'header', NAV:'nav', MAIN:'main', FOOTER:'footer', ASIDE:'aside', DIALOG:'dialog', FORM:'form'};
+  const where = r => r.bottom <= 0 ? -1 : r.top >= vh ? 1 : 0;
+  const emit = (e, line) => {
+    const r = e.getBoundingClientRect();
+    const w = where(r);
+    if (!all && w !== 0) { if (w > 0) below++; else above++; return; }
+    if (find && !line.toLowerCase().includes(find)) return;
+    lines.push(line);
+  };
+  const walk = (e, depth) => {
+    if (e.nodeType !== 1) return;
+    const st = getComputedStyle(e);
+    if (st.display === 'none' || st.visibility === 'hidden') return;
+    if (st.display !== 'contents' && !isVis(e)) return;
+    const t = e.tagName;
+    if (t === 'SCRIPT' || t === 'STYLE' || t === 'NOSCRIPT' || t === 'TEMPLATE') return;
+    const land = LAND[t] || (e.getAttribute('role') === 'dialog' ? 'dialog' : '');
+    if (land) { emit(e, '# ' + land + (e.getAttribute('aria-label') ? ' "' + norm(e.getAttribute('aria-label')) + '"' : '')); }
+    if (e.matches(INTER) || (e.tabIndex >= 0 && getComputedStyle(e).cursor === 'pointer' && t !== 'BODY')) {
+      const ref = 'e' + (++n);
+      e.setAttribute('data-cdpm-ref', ref);
+      let line = ref + ' ' + roleOf(e) + ' "' + nameOf(e).slice(0, 80) + '"';
+      if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') {
+        if (e.type === 'checkbox' || e.type === 'radio') line += e.checked ? ' [x]' : ' [ ]';
+        else if (e.value) line += ' = "' + norm(e.value).slice(0, 60) + '"';
+      }
+      if (e.disabled || e.getAttribute('aria-disabled') === 'true') line += ' disabled';
+      if (e.getAttribute('aria-expanded')) line += ' expanded=' + e.getAttribute('aria-expanded');
+      if (e.getAttribute('aria-selected') === 'true' || e.getAttribute('aria-current')) line += ' current';
+      if (t === 'A' && opts.href) line += ' -> ' + (e.getAttribute('href') || '').slice(0, 80);
+      emit(e, line);
+      return;
+    }
+    if (/^H[1-6]$/.test(t)) { emit(e, t.toLowerCase() + ' "' + norm(e.innerText).slice(0, 120) + '"'); return; }
+    if (t === 'IMG') { const alt = norm(e.getAttribute('alt')); emit(e, 'img "' + (alt || (e.getAttribute('src') || '').split('/').pop().slice(0, 40)) + '"'); return; }
+    if (t === 'svg' || t === 'SVG') return;
+    if (isTextBlock(e)) { emit(e, '"' + norm(e.innerText).slice(0, 160) + '"'); return; }
+    const own = ownText(e);
+    if (own && /[\p{L}\p{N}]/u.test(own)) emit(e, '"' + own.slice(0, 160) + '"');
+    for (const c of e.children) walk(c, depth + 1);
+    if (e.shadowRoot) for (const c of e.shadowRoot.children) walk(c, depth + 1);
+  };
+  walk(document.body, 0);
+  const dedup = lines.filter((l, i) => i === 0 || l !== lines[i - 1]);
+  return {lines: dedup.slice(0, max), cut: Math.max(0, dedup.length - max), below, above,
+          url: location.href, title: document.title, sy: Math.round(scrollY),
+          sh: document.documentElement.scrollHeight, vh, vw};
+}
+"""
+
+JS_TEXTS = JS_HELPERS + r"""
+() => {
+  const out = [];
+  const walk = e => {
+    if (e.nodeType !== 1) return;
+    const st = getComputedStyle(e);
+    if (st.display === 'none' || st.visibility === 'hidden') return;
+    if (st.display !== 'contents' && !isVis(e)) return;
+    if (['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','svg'].includes(e.tagName)) return;
+    const r = e.getBoundingClientRect();
+    if (st.display !== 'contents' && (r.bottom <= 0 || r.top >= innerHeight)) { if (!e.children.length) return; }
+    if (e.matches(INTER) || /^H[1-6]$/.test(e.tagName) || isTextBlock(e)) {
+      if (r.bottom > 0 && r.top < innerHeight) { const n = nameOf(e); if (n) out.push(n.slice(0, 100)); }
+      return;
+    }
+    for (const c of e.children) walk(c);
+  };
+  walk(document.body);
+  return out;
+}
+"""
+
+JS_FIND = JS_HELPERS + r"""
+(q) => {
+  const want = norm(q).toLowerCase();
+  let best = null, bestScore = 99, bestArea = 1e12;
+  const vh = innerHeight;
+  for (const e of document.querySelectorAll('body *')) {
+    if (['SCRIPT','STYLE','HTML','BODY'].includes(e.tagName)) continue;
+    if (!isVis(e)) continue;
+    const inter = e.matches(INTER);
+    const name = nameOf(e).toLowerCase();
+    if (!name) continue;
+    let s;
+    if (name === want) s = inter ? 0 : 2;
+    else if (name.includes(want)) s = inter ? 1 : 3;
+    else continue;
+    const r = e.getBoundingClientRect();
+    if (r.bottom <= 0 || r.top >= vh) s += 0.5;
+    const area = r.width * r.height;
+    if (s < bestScore || (s === bestScore && area < bestArea)) { best = e; bestScore = s; bestArea = area; }
+  }
+  if (!best) return null;
+  if (!best.matches(INTER)) { const up = best.closest(INTER); if (up && nameOf(up).toLowerCase().includes(want)) best = up; }
+  let ref = best.getAttribute('data-cdpm-ref');
+  if (!ref) { ref = 'f' + Math.random().toString(36).slice(2, 8); best.setAttribute('data-cdpm-ref', ref); }
+  return {ref, name: nameOf(best).slice(0, 80), role: best.matches(INTER) ? roleOf(best) : best.tagName.toLowerCase()};
+}
+"""
+
+STYLE_PROPS = ["font-family", "font-size", "font-weight", "font-style", "line-height", "letter-spacing",
+               "color", "text-transform", "text-decoration-line", "text-align",
+               "background-color", "background-image", "border-top-width", "border-right-width",
+               "border-bottom-width", "border-left-width", "border-top-color", "border-right-color",
+               "border-bottom-color", "border-left-color", "border-top-style", "border-top-left-radius",
+               "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
+               "box-shadow", "padding-top", "padding-right", "padding-bottom", "padding-left",
+               "opacity", "gap", "display"]
+
+JS_EXTRACT = JS_HELPERS + r"""
+(opts) => {
+  const root = opts.frame ? document.querySelector(opts.frame) : document.body;
+  if (!root) return {error: 'frame not found: ' + opts.frame};
+  const R = root.getBoundingClientRect();
+  const ox = R.left + scrollX + root.clientLeft, oy = R.top + scrollY + root.clientTop;
+  const PROPS = opts.props;
+  const items = [];
+  const transparent = c => !c || c === 'transparent' || /rgba\(.*,\s*0\)$/.test(c);
+  const walk = (e, depth, parentBg, par) => {
+    if (e.nodeType !== 1 || items.length > 4000) return;
+    let me = par;
+    const t = e.tagName;
+    if (['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','HELMET','LINK','META'].includes(t)) return;
+    const s = getComputedStyle(e);
+    if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return;
+    const contents = s.display === 'contents';
+    const r = e.getBoundingClientRect();
+    const sized = r.width > 0 && r.height > 0;
+    const bg = s.backgroundColor;
+    if (!contents && sized && e !== root) {
+      const own = ownText(e);
+      const svg = t.toLowerCase() === 'svg';
+      const img = t === 'IMG' || svg || t === 'CANVAS' || t === 'VIDEO' || t === 'PICTURE' || /url\(/.test(s.backgroundImage);
+      const bordered = ['Top','Right','Bottom','Left'].some(k => parseFloat(s['border' + k + 'Width']) > 0 && s['border' + k + 'Style'] !== 'none');
+      const box = (!transparent(bg) && bg !== parentBg) || bordered || s.boxShadow !== 'none' || /gradient/.test(s.backgroundImage);
+      const inter = e.matches(INTER);
+      if (own || img || box || inter || e.dataset.cdpm || e.dataset.testid) {
+        const st = {};
+        for (const p of PROPS) st[p] = s.getPropertyValue(p);
+        me = items.length;
+        items.push({
+          i: items.length, tag: t.toLowerCase(), depth, par,
+          key: e.dataset.cdpm || e.dataset.testid || '',
+          text: own.slice(0, 160),
+          full: norm(e.innerText || e.textContent).slice(0, 160),
+          alt: img ? (e.getAttribute('alt') || e.getAttribute('aria-label') || (e.getAttribute('src') || '').split('/').pop().split('?')[0] || '') : '',
+          kind: own ? 'text' : img ? 'img' : 'box',
+          x: Math.round(r.left + scrollX - ox), y: Math.round(r.top + scrollY - oy),
+          w: Math.round(r.width), h: Math.round(r.height), st,
+        });
+      }
+      if (svg) return;
+    }
+    const nextBg = (!contents && !transparent(bg)) ? bg : parentBg;
+    for (const c of e.children) walk(c, depth + 1, nextBg, me);
+    if (e.shadowRoot) for (const c of e.shadowRoot.children) walk(c, depth + 1, nextBg, me);
+  };
+  let rootBg = getComputedStyle(root).backgroundColor;
+  if (transparent(rootBg)) rootBg = getComputedStyle(document.body).backgroundColor;
+  for (const c of root.children) walk(c, 1, rootBg, -1);
+  return {items, frame: {x: Math.round(ox), y: Math.round(oy), w: root.clientWidth, h: root.clientHeight,
+          bw: Math.round(R.width), bh: Math.round(R.height), bg: rootBg}};
+}
+"""
+
+JS_FRAMES = r"""
+() => {
+  const out = [];
+  const opts = document.querySelectorAll('.dv-opt');
+  if (opts.length) {
+    for (const o of opts) {
+      const card = o.querySelector('.dv-card') || o.lastElementChild;
+      const r = card.getBoundingClientRect();
+      const label = (o.querySelector('.dv-olabel') || {}).innerText || '';
+      out.push({sel: '[id="' + o.id + '"] .dv-card', w: card.clientWidth, h: card.clientHeight,
+                label: label.replace(/\s+/g, ' ').trim().slice(0, 90)});
+    }
+    return {canvas: true, frames: out};
+  }
+  return {canvas: false, frames: [{sel: 'body', w: document.documentElement.scrollWidth,
+           h: document.documentElement.scrollHeight, label: document.title}]};
+}
+"""
+
+
+# --- device control commands -----------------------------------------------------------------
+
+def settle(page, ms=2500):
+    try:
+        page.wait_for_load_state("networkidle", timeout=ms)
+    except Exception:
+        pass
+    try:
+        page.evaluate("document.fonts && document.fonts.ready.then(() => 1)")
+    except Exception:
+        pass
+
+
+def page_head(page):
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    return f"{page.url}  \"{title[:80]}\""
+
+
+def print_ui(page, all_=False, find=None, max_lines=150, href=False):
+    r = run_js(page, JS_UI, {"all": all_, "find": find or "", "max": max_lines, "href": href})
+    out(f"{r['url']}  \"{r['title'][:80]}\"  {r['vw']}x{r['vh']} scroll {r['sy']}/{max(0, r['sh'] - r['vh'])}")
+    for line in r["lines"]:
+        out(line)
+    tail = []
+    if r["cut"]:
+        tail.append(f"+{r['cut']} lines cut (--max)")
+    if r["above"]:
+        tail.append(f"{r['above']} above")
+    if r["below"]:
+        tail.append(f"{r['below']} below (scroll down or --all)")
+    if tail:
+        out("… " + ", ".join(tail))
+    return r
+
+
+def run_js(page, js, arg=None):
+    """Evaluates a `JS_HELPERS + (fn)` source: helpers become locals of a wrapper."""
+    helpers, fn = js.split("\n(", 1)
+    fn = "(" + fn
+    src = f"(arg) => {{ {helpers} return ({fn})(arg); }}"
+    return page.evaluate(src, arg)
+
+
+def visible_texts(page):
+    try:
+        return run_js(page, JS_TEXTS)
+    except Exception:
+        return []
+
+
+def report_change(page, before_url, before_texts, max_lines=8):
+    settle(page)
+    after = visible_texts(page)
+    if page.url != before_url:
+        out(f"-> {page_head(page)}")
+    bs, as_ = set(before_texts), set(after)
+    added = [t for t in after if t not in bs]
+    gone = [t for t in before_texts if t not in as_]
+    if page.url != before_url and len(added) + len(gone) > max_lines:
+        out(f"new page: {len(added)} texts appeared, {len(gone)} went away (cdpm ui)")
+        return
+    if not added and not gone and page.url == before_url:
+        out("no visible change")
+        return
+    for t in added[:max_lines]:
+        out(f"+ {t}")
+    if len(added) > max_lines:
+        out(f"+ … {len(added) - max_lines} more")
+    for t in gone[:max_lines]:
+        out(f"- {t}")
+    if len(gone) > max_lines:
+        out(f"- … {len(gone) - max_lines} more")
+
+
+def resolve(page, target):
+    if target.startswith("@"):
+        ref = target[1:]
+        loc = page.locator(f'[data-cdpm-ref="{ref}"]')
+        if loc.count() == 0:
+            die(f"{target} is gone: refs change after every ui; run cdpm ui again", 1)
+        return loc.first, target
+    if target.startswith("css="):
+        loc = page.locator(target[4:])
+        if loc.count() == 0:
+            die(f"no element matches {target[4:]!r}", 1)
+        return loc.first, target
+    r = run_js(page, JS_FIND, target)
+    if not r:
+        try:
+            loc = page.locator(target)
+            if loc.count():
+                return loc.first, target
+        except Exception:
+            pass
+        die(f"not found on the page: {target!r} (cdpm ui --find …)", 1)
+    return page.locator(f'[data-cdpm-ref="{r["ref"]}"]').first, f'{r["role"]} "{r["name"]}"'
+
+
+def wait_text(page, text, timeout):
+    end = time.time() + timeout
+    want = text.lower()
+    while True:
+        try:
+            body = page.evaluate("document.title + '\\n' + (document.body ? document.body.innerText : '')")
+        except Exception:
+            body = ""
+        if want in body.lower():
+            return True
+        if time.time() > end:
+            return False
+        time.sleep(0.25)
+
+
+def do_expect(page, text, timeout):
+    if text is None:
+        return True
+    if wait_text(page, text, timeout):
+        out(f"ok: \"{text}\" is on the page")
+        return True
+    out(f"FAIL: \"{text}\" did not appear in {timeout:g}s")
+    return False
+
+
+def act_click(sess, target, expect=None, timeout=8.0):
+    page = sess.page
+    loc, label = resolve(page, target)
+    url0, texts0 = page.url, visible_texts(page)
+    loc.click()
+    out(f"click {label}")
+    report_change(page, url0, texts0)
+    return do_expect(page, expect, timeout)
+
+
+def act_type(sess, text, into=None, submit=False):
+    page = sess.page
+    url0, texts0 = page.url, visible_texts(page)
+    if into:
+        loc, label = resolve(page, into)
+        loc.fill(text)
+        out(f"type into {label}")
+    else:
+        page.keyboard.insert_text(text)
+        out("type into the focused element")
+    if submit:
+        page.keyboard.press("Enter")
+        report_change(page, url0, texts0)
+    return True
+
+
+def act_key(sess, key):
+    page = sess.page
+    url0, texts0 = page.url, visible_texts(page)
+    page.keyboard.press(key)
+    out(f"key {key}")
+    report_change(page, url0, texts0)
+    return True
+
+
+def act_scroll(sess, where):
+    page = sess.page
+    if where in ("down", "up"):
+        page.mouse.wheel(0, (1 if where == "down" else -1) * int(page.viewport_size["height"] * 0.8))
+    elif where == "top":
+        page.evaluate("scrollTo(0, 0)")
+    elif where == "bottom":
+        page.evaluate("scrollTo(0, document.documentElement.scrollHeight)")
+    else:
+        loc, label = resolve(page, where)
+        loc.scroll_into_view_if_needed()
+    page.wait_for_timeout(250)
+    y, h = page.evaluate("[Math.round(scrollY), document.documentElement.scrollHeight - innerHeight]")
+    out(f"scroll {where}: {y}/{max(0, h)}")
+    return True
+
+
+def act_goto(sess, url):
+    page = sess.page
+    try:
+        resp = page.goto(normalize_url(url), wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        out(f"FAIL: {str(e).splitlines()[0][:200]}")
+        return False
+    settle(page, 5000)
+    status = resp.status if resp else "?"
+    out(f"{status} {page_head(page)}")
+    errs = recent_errors(since=time.time() - 30)
+    if errs:
+        out(f"! {len(errs)} console errors (cdpm log)")
+    return status == "?" or int(status) < 400
+
+
+def normalize_url(url):
+    if re.match(r"^[a-z]+:", url):
+        return url
+    if os.path.exists(url):
+        return "file://" + os.path.abspath(url)
+    if re.match(r"^(localhost|127\.|\d+\.\d+\.\d+\.\d+)(:\d+)?", url) or re.match(r"^:\d+", url):
+        return "http://" + url.lstrip(":") if not url.startswith(":") else "http://localhost" + url
+    return "https://" + url
+
+
+def recent_errors(since=0):
+    path = os.path.join(cache_dir(), "console.jsonl")
+    res = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("t", 0) >= since and (e["kind"] in ("pageerror", "netfail", "http")
+                                               or e.get("level") == "error"):
+                    res.append(e)
+    except OSError:
+        pass
+    return res
+
+
+def cmd_open(a):
+    w, h = parse_size(a.size) if a.size else (1280, 900)
+    s = load_session()
+    if s and alive(s.get("pid")) and (a.size or a.theme):
+        set_view(w if a.size else s["width"], h if a.size else s["height"], a.theme or s.get("theme"))
+    else:
+        start_daemon(w, h, a.theme or "light", a.locale or "en-US")
+    sess = Session()
+    try:
+        ok = act_goto(sess, a.url)
+        if ok and not a.quiet:
+            print_ui(sess.page, max_lines=a.max)
+    finally:
+        sess.close()
+    return 0 if ok else 1
+
+
+def set_view(w, h, theme):
+    s = load_session()
+    s.update(width=w, height=h, theme=theme or "light", rev=s.get("rev", 0) + 1)
+    save_session(s)
+    for _ in range(40):
+        time.sleep(0.1)
+        cur = load_session() or {}
+        if cur.get("applied") == cur.get("rev"):
+            return
+    die("the browser did not apply the new viewport; try cdpm close")
+
+
+def cmd_view(a):
+    s = load_session()
+    if not s or not alive(s.get("pid")):
+        die("no browser: start one with cdpm open <url>")
+    w, h = parse_size(a.size) if a.size else (s["width"], s["height"])
+    set_view(w, h, a.theme or s.get("theme"))
+    out(f"viewport {w}x{h}, theme {a.theme or s.get('theme')}")
+    return 0
+
+
+def cmd_ui(a):
+    sess = Session()
+    try:
+        print_ui(sess.page, all_=a.all, find=a.find, max_lines=a.max, href=a.href)
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_click(a):
+    sess = Session()
+    try:
+        return 0 if act_click(sess, a.target, a.expect, a.timeout) else 1
+    finally:
+        sess.close()
+
+
+def cmd_type(a):
+    sess = Session()
+    try:
+        act_type(sess, a.text, a.into, a.enter)
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_key(a):
+    sess = Session()
+    try:
+        act_key(sess, a.key)
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_hover(a):
+    sess = Session()
+    try:
+        loc, label = resolve(sess.page, a.target)
+        loc.hover()
+        sess.page.wait_for_timeout(200)
+        out(f"hover {label}")
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_scroll(a):
+    sess = Session()
+    try:
+        act_scroll(sess, a.where)
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_goto(a):
+    sess = Session()
+    try:
+        ok = act_goto(sess, a.url)
+        if ok and not a.quiet:
+            print_ui(sess.page, max_lines=a.max)
+    finally:
+        sess.close()
+    return 0 if ok else 1
+
+
+def cmd_back(a):
+    sess = Session()
+    try:
+        sess.page.go_back()
+        settle(sess.page)
+        out(f"-> {page_head(sess.page)}")
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_reload(a):
+    sess = Session()
+    try:
+        sess.page.reload()
+        settle(sess.page, 5000)
+        out(f"reloaded {page_head(sess.page)}")
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_wait(a):
+    sess = Session()
+    try:
+        ok = wait_text(sess.page, a.text, a.timeout)
+        out(f"ok: \"{a.text}\"" if ok else f"FAIL: \"{a.text}\" not on the page after {a.timeout:g}s")
+    finally:
+        sess.close()
+    return 0 if ok else 1
+
+
+def cmd_assert(a):
+    a.timeout = 0
+    return cmd_wait(a)
+
+
+def cmd_batch(a):
+    sess = Session()
+    code = 0
+    try:
+        for step in a.steps:
+            argv = shlex.split(step)
+            if not argv:
+                continue
+            out(f"> {step}")
+            ok = True
+            try:
+                ok = run_step(sess, argv)
+            except SystemExit as e:
+                ok = e.code == 0
+            except Exception as e:
+                out(f"FAIL: {str(e).splitlines()[0][:200]}")
+                ok = False
+            if not ok:
+                code = 1
+                if not a.keep_going:
+                    out("stopped at the first failure (--keep-going runs the rest)")
+                    break
+        if a.ui:
+            print_ui(sess.page, max_lines=a.max)
+    finally:
+        sess.close()
+    return code
+
+
+def run_step(sess, argv):
+    p = argparse.ArgumentParser(prog="step", add_help=False, exit_on_error=False)
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("click", "tap"):
+        p.add_argument("target"); p.add_argument("--expect"); p.add_argument("--timeout", type=float, default=8)
+        x = p.parse_args(rest)
+        return act_click(sess, x.target, x.expect, x.timeout)
+    if cmd == "type":
+        p.add_argument("text"); p.add_argument("--into"); p.add_argument("--enter", action="store_true")
+        x = p.parse_args(rest)
+        return act_type(sess, x.text, x.into, x.enter)
+    if cmd == "fill":
+        x_target, x_text = rest[0], rest[1]
+        return act_type(sess, x_text, x_target)
+    if cmd == "key":
+        return act_key(sess, rest[0])
+    if cmd == "scroll":
+        return act_scroll(sess, rest[0] if rest else "down")
+    if cmd == "goto":
+        return act_goto(sess, rest[0])
+    if cmd == "wait":
+        p.add_argument("text"); p.add_argument("--timeout", type=float, default=8)
+        x = p.parse_args(rest)
+        return do_expect(sess.page, x.text, x.timeout)
+    if cmd == "assert":
+        return do_expect(sess.page, rest[0], 0)
+    if cmd == "hover":
+        loc, label = resolve(sess.page, rest[0])
+        loc.hover()
+        out(f"hover {label}")
+        return True
+    if cmd == "ui":
+        print_ui(sess.page)
+        return True
+    if cmd == "sleep":
+        sess.page.wait_for_timeout(float(rest[0]) * 1000)
+        return True
+    out(f"FAIL: unknown step {cmd!r}: click type fill key scroll goto wait assert hover ui sleep")
+    return False
+
+
+def cmd_log(a):
+    since = time.time() - a.since * 60 if a.since else 0
+    path = os.path.join(cache_dir(), "console.jsonl")
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("t", 0) < since:
+                    continue
+                if a.errors and not (e["kind"] != "console" or e.get("level") in ("error", "warning")):
+                    continue
+                txt = e.get("text") or e.get("url") or ""
+                if a.grep and not re.search(a.grep, txt, re.I):
+                    continue
+                rows.append(e)
+    except OSError:
+        out("no log yet")
+        return 0
+    if a.clear:
+        open(path, "w").close()
+        out("log cleared")
+        return 0
+    if not rows:
+        out("no matching entries")
+        return 0
+    seen = {}
+    for e in rows:
+        if e["kind"] == "console":
+            k = f"{e['level']}: {e['text'][:300]}"
+        elif e["kind"] == "pageerror":
+            k = f"pageerror: {e['text'][:300]}"
+        elif e["kind"] == "http":
+            k = f"http {e['status']}: {e['url'][:200]}"
+        else:
+            k = f"netfail {e.get('error', '')}: {e['url'][:200]}"
+        seen[k] = seen.get(k, 0) + 1
+    items = list(seen.items())[-a.max:]
+    for k, n in items:
+        out(k + (f"  ×{n}" if n > 1 else ""))
+    return 0
+
+
+def cmd_style(a):
+    sess = Session()
+    try:
+        loc, label = resolve(sess.page, a.target)
+        props = a.props.split(",") if a.props else STYLE_PROPS
+        r = loc.evaluate("(e, props) => { const s = getComputedStyle(e); const b = e.getBoundingClientRect();"
+                         " return {st: Object.fromEntries(props.map(p => [p, s.getPropertyValue(p)])),"
+                         " box: [Math.round(b.left + scrollX), Math.round(b.top + scrollY), Math.round(b.width), Math.round(b.height)]}; }",
+                         props)
+        x, y, w, h = r["box"]
+        out(f"{label}  @{x},{y} {w}x{h}")
+        st = compact_styles(r["st"], full=bool(a.props))
+        for k, v in st.items():
+            out(f"  {k}: {v}")
+    finally:
+        sess.close()
+    return 0
+
+
+DEFAULTS = {"font-style": "normal", "text-transform": "none", "text-decoration-line": "none",
+            "letter-spacing": "normal", "background-color": "rgba(0, 0, 0, 0)", "background-image": "none",
+            "box-shadow": "none", "opacity": "1", "gap": "normal", "text-align": "start"}
+
+
+def compact_styles(st, full=False):
+    res = {}
+    border = {}
+    for k, v in st.items():
+        if not full and DEFAULTS.get(k) == v:
+            continue
+        if k.startswith("border-") and not full:
+            border[k] = v
+            continue
+        res[k] = v
+    if border:
+        widths = [border.get(f"border-{s}-width", "0px") for s in ("top", "right", "bottom", "left")]
+        if any(w != "0px" for w in widths):
+            res["border"] = f"{' '.join(widths)} {border.get('border-top-style', '')} {border.get('border-top-color', '')}"
+        radii = [border.get(f"border-{s}-radius", "0px") for s in ("top-left", "top-right", "bottom-right", "bottom-left")]
+        if any(r != "0px" for r in radii):
+            res["border-radius"] = radii[0] if len(set(radii)) == 1 else " ".join(radii)
+    pads = [res.pop(f"padding-{s}", "0px") for s in ("top", "right", "bottom", "left")]
+    if any(p != "0px" for p in pads):
+        res["padding"] = pads[0] if len(set(pads)) == 1 else " ".join(pads)
+    return res
+
+
+def cmd_eval(a):
+    sess = Session()
+    try:
+        r = sess.page.evaluate(a.js)
+        s = r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)
+        out(s[:a.max_chars] + (f"… ({len(s)} chars)" if len(s) > a.max_chars else ""))
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_look(a):
+    from PIL import Image
+    global _IMAGES
+    sess = Session()
+    try:
+        d = os.path.join(cache_dir(), "look")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, dt.datetime.now().strftime("%H%M%S") + ".png")
+        if a.target:
+            loc, label = resolve(sess.page, a.target)
+            loc.screenshot(path=path, animations="disabled")
+        else:
+            sess.page.screenshot(path=path, full_page=a.full, animations="disabled")
+        im = Image.open(path)
+        if a.crop:
+            x0, y0, x1, y1 = [int(v) for v in a.crop.split(",")]
+            im = im.crop((x0, y0, x1, y1))
+        if im.width > a.width:
+            im = im.resize((a.width, max(1, round(im.height * a.width / im.width))), Image.LANCZOS)
+        if im.height > 2000:
+            im = im.crop((0, 0, im.width, 2000))
+        im.convert("RGB").save(path)
+        _IMAGES += 1
+        out(f"{rel(path)}  {im.width}x{im.height} ~{image_tokens(im.width, im.height)} tokens")
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_shot(a):
+    sess = Session()
+    try:
+        d = os.path.join(cache_dir(), "shots")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, slugify(a.name, 40) + ".png")
+        sess.page.screenshot(path=path, full_page=not a.viewport, animations="disabled")
+        out(f"{rel(path)}  (for the person: give the path, do not read it)")
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_tabs(a):
+    sess = Session()
+    try:
+        pages = sess.ctx.pages
+        if a.switch is not None:
+            s = load_session()
+            s["tab"] = a.switch
+            save_session(s)
+            out(f"tab {a.switch}: {page_head(pages[a.switch])}")
+            return 0
+        for i, p in enumerate(pages):
+            out(f"{'*' if p == sess.page else ' '} {i} {page_head(p)}")
+    finally:
+        sess.close()
+    return 0
+
+
+def cmd_close(a):
+    s = load_session()
+    if not s or not alive(s.get("pid")):
+        out("no browser")
+        try:
+            os.remove(session_path())
+        except OSError:
+            pass
+        return 0
+    s["stop"] = True
+    save_session(s)
+    for _ in range(50):
+        time.sleep(0.1)
+        if not alive(s["pid"]):
+            break
+    else:
+        os.kill(s["pid"], signal.SIGTERM)
+    out("browser closed")
+    return 0
+
+
+# --- design sources --------------------------------------------------------------------------
+
+def redact(url):
+    """Design serve URLs carry an access token: never print or store it."""
+    if not re.match(r"^https?://", url):
+        return url
+    u = urllib.parse.urlsplit(url)
+    name = urllib.parse.unquote(u.path.rsplit("/", 1)[-1])
+    return f"{u.scheme}://{u.hostname}/…/{name}" if u.query else f"{u.scheme}://{u.hostname}{urllib.parse.unquote(u.path)}"
+
+
+def design_label(src):
+    if re.match(r"^https?://", src):
+        return redact(src)
+    return rel(os.path.abspath(src))
+
+
+def cmd_frames(a):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        pg = b.new_context(**context_options(1440, 900, "light", "en-US")).new_page()
+        load_static(pg, a.design)
+        r = pg.evaluate(JS_FRAMES)
+        b.close()
+    if r["canvas"]:
+        out(f"Claude Design canvas: {len(r['frames'])} frames")
+    for f in r["frames"]:
+        out(f"--frame '{f['sel']}'  {f['w']}x{f['h']}  {f['label']}")
+    return 0
+
+
+def load_static(page, src, frame=None):
+    url = src if re.match(r"^https?://|^file://", src) else "file://" + os.path.abspath(src)
+    try:
+        page.goto(url, wait_until="networkidle", timeout=45000)
+    except Exception as e:
+        msg = str(e).splitlines()[0]
+        if "Timeout" not in msg:
+            die(f"cannot open {design_label(src)}: {msg[:160]}")
+    page.add_style_tag(content=STOP_ANIM_CSS)
+    page.evaluate("document.fonts ? document.fonts.ready.then(() => 1) : 1")
+    if frame:
+        try:
+            page.wait_for_selector(frame, state="attached", timeout=5000)
+        except Exception:
+            pass
+    page.wait_for_timeout(300)
+    if frame:
+        snap_frame(page, frame)
+
+
+def snap_frame(page, frame):
+    """A frame at a fractional position renders text with other antialiasing than the site:
+    pad the page so the frame starts on a whole pixel."""
+    page.evaluate("""(sel) => {
+        const e = document.querySelector(sel); if (!e) return;
+        for (let k = 0; k < 2; k++) {
+            const r = e.getBoundingClientRect();
+            const fy = (r.top + scrollY) % 1, fx = (r.left + scrollX) % 1;
+            if (Math.abs(fy) < 0.01 && Math.abs(fx) < 0.01) return;
+            const b = document.body.style;
+            if (fy) b.paddingTop = (parseFloat(getComputedStyle(document.body).paddingTop) + (1 - fy)) + 'px';
+            if (fx) b.paddingLeft = (parseFloat(getComputedStyle(document.body).paddingLeft) + (1 - fx)) + 'px';
+        }
+    }""", frame)
+
+
+def cmd_pull(a):
+    """Saves a rendered design (with its same-origin files) to a folder, without the token."""
+    from playwright.sync_api import sync_playwright
+    out_dir = os.path.abspath(a.out)
+    os.makedirs(out_dir, exist_ok=True)
+    src = a.design
+    u = urllib.parse.urlsplit(src)
+    base_dir = u.path.rsplit("/", 1)[0] + "/"
+    saved = []
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        pg = b.new_context(**context_options(1440, 900, "light", "en-US")).new_page()
+        bodies = {}
+
+        def grab(r):
+            ru = urllib.parse.urlsplit(r.url)
+            if ru.hostname == u.hostname and ru.path != u.path and ru.path.startswith(base_dir) and r.ok:
+                try:
+                    bodies[urllib.parse.unquote(ru.path[len(base_dir):])] = r.body()
+                except Exception:
+                    pass
+        pg.on("response", grab)
+        load_static(pg, src)
+        doc = pg.evaluate("""() => {
+            const d = document.documentElement.cloneNode(true);
+            d.querySelectorAll('script').forEach(s => s.remove());
+            return '<!DOCTYPE html>\\n' + d.outerHTML; }""")
+        b.close()
+    origin_dir = f"{u.scheme}://{u.netloc}{base_dir}"
+    doc = doc.replace(origin_dir, "")
+    doc = re.sub(r"\?t=[0-9a-f.\-]+(&amp;|&)?(direct=1)?", "", doc)
+    name = a.name or urllib.parse.unquote(u.path.rsplit("/", 1)[-1]).replace(".dc.html", ".html")
+    if not name.endswith(".html"):
+        name += ".html"
+    with open(os.path.join(out_dir, name), "w") as f:
+        f.write(doc)
+    saved.append(name)
+    for path, body in bodies.items():
+        if path.endswith(".js"):
+            continue
+        dst = os.path.join(out_dir, path)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(body)
+        saved.append(path)
+    with open(os.path.join(out_dir, "design.json"), "w") as f:
+        json.dump({"source": redact(src), "pulled": dt.datetime.now().isoformat(timespec="seconds"),
+                   "files": saved}, f, ensure_ascii=False, indent=1)
+    out(f"pulled {design_label(src)} -> {rel(os.path.join(out_dir, name))} (+{len(saved) - 1} files, scripts removed)")
+    return 0
+
+
+# --- compare: design vs site -----------------------------------------------------------------
+
+def parse_color(v):
+    m = re.match(r"rgba?\(([^)]+)\)", v or "")
+    if not m:
+        return None
+    parts = [p.strip() for p in re.split(r"[,\s/]+", m.group(1)) if p.strip()]
+    try:
+        r, g, b = (float(x) for x in parts[:3])
+        al = float(parts[3]) if len(parts) > 3 else 1.0
+    except ValueError:
+        return None
+    return r, g, b, al
+
+
+def hexcolor(v):
+    c = parse_color(v)
+    if not c:
+        return v
+    r, g, b, al = c
+    h = "#%02x%02x%02x" % (round(r), round(g), round(b))
+    return h if al >= 0.999 else f"{h}/{al:.2f}".rstrip("0").rstrip(".")
+
+
+def color_dist(a, b):
+    ca, cb = parse_color(a), parse_color(b)
+    if not ca or not cb:
+        return 0 if a == b else 999
+    if ca[3] < 0.01 and cb[3] < 0.01:
+        return 0
+    return max(abs(ca[i] - cb[i]) for i in range(3)) + abs(ca[3] - cb[3]) * 255
+
+
+def px(v):
+    try:
+        return float(str(v).replace("px", ""))
+    except ValueError:
+        return None
+
+
+def family(v):
+    return (v or "").split(",")[0].strip().strip("'\"").lower()
+
+
+def line_height(st):
+    lh = st.get("line-height", "normal")
+    if lh == "normal":
+        fs = px(st.get("font-size")) or 16
+        return round(fs * 1.2, 1)
+    return px(lh)
+
+
+def ls_px(st):
+    v = st.get("letter-spacing", "normal")
+    return 0.0 if v == "normal" else (px(v) or 0.0)
+
+
+TEXT_PROPS = ("font-family", "font-size", "font-weight", "font-style", "line-height", "letter-spacing",
+              "color", "text-transform", "text-decoration-line")
+BOX_PROPS = ("background-color", "border", "border-radius", "box-shadow", "padding", "opacity")
+
+
+def summarize_box(st):
+    widths = [px(st.get(f"border-{s}-width")) or 0 for s in ("top", "right", "bottom", "left")]
+    style = st.get("border-top-style", "none")
+    colors = [st.get(f"border-{s}-color") for s in ("top", "right", "bottom", "left")]
+    radii = [px(st.get(f"border-{s}-radius")) or 0 for s in ("top-left", "top-right", "bottom-right", "bottom-left")]
+    pads = [px(st.get(f"padding-{s}")) or 0 for s in ("top", "right", "bottom", "left")]
+    return widths, colors, style, radii, pads
+
+
+def fmt_n(v):
+    return str(int(v)) if v == int(v) else f"{v:.1f}"
+
+
+def fmt4(vals):
+    return fmt_n(vals[0]) if len(set(vals)) == 1 else " ".join(fmt_n(v) for v in vals)
+
+
+def style_diffs(d, s, tol):
+    """Returns [(prop, design, site, major)]."""
+    res = []
+    ds, ss = d["st"], s["st"]
+    if d["kind"] == "text" or d["text"]:
+        if family(ds["font-family"]) != family(ss["font-family"]):
+            res.append(("font-family", family(ds["font-family"]), family(ss["font-family"]), True))
+        a, b = px(ds["font-size"]), px(ss["font-size"])
+        if a is not None and b is not None and abs(a - b) > tol["font"]:
+            res.append(("font-size", fmt_n(a), fmt_n(b), abs(a - b) >= 2))
+        if ds["font-weight"] != ss["font-weight"]:
+            res.append(("font-weight", ds["font-weight"], ss["font-weight"], True))
+        if ds["font-style"] != ss["font-style"]:
+            res.append(("font-style", ds["font-style"], ss["font-style"], True))
+        a, b = line_height(ds), line_height(ss)
+        if a is not None and b is not None and abs(a - b) > tol["font"]:
+            res.append(("line-height", fmt_n(a), fmt_n(b), abs(a - b) >= 4))
+        a, b = ls_px(ds), ls_px(ss)
+        if abs(a - b) > 0.15:
+            res.append(("letter-spacing", f"{a:.2f}".rstrip("0").rstrip("."), f"{b:.2f}".rstrip("0").rstrip("."), abs(a - b) >= 1))
+        cd = color_dist(ds["color"], ss["color"])
+        if cd > tol["color"]:
+            res.append(("color", hexcolor(ds["color"]), hexcolor(ss["color"]), cd > 24))
+        for p in ("text-transform", "text-decoration-line"):
+            if ds[p] != ss[p]:
+                res.append((p, ds[p], ss[p], True))
+    cd = color_dist(ds["background-color"], ss["background-color"])
+    if cd > tol["color"]:
+        res.append(("background", hexcolor(ds["background-color"]), hexcolor(ss["background-color"]), cd > 30))
+    dg, sg = "gradient" in ds["background-image"], "gradient" in ss["background-image"]
+    if dg != sg:
+        res.append(("background-image", "gradient" if dg else "none", "gradient" if sg else "none", True))
+    dw, dc, dst, dr, dp = summarize_box(ds)
+    sw, sc, sst, sr, sp = summarize_box(ss)
+    if any(abs(x - y) > 0.5 for x, y in zip(dw, sw)):
+        res.append(("border-width", fmt4(dw), fmt4(sw), True))
+    elif any(w > 0 for w in dw) and max(color_dist(x, y) for x, y in zip(dc, sc)) > tol["color"]:
+        res.append(("border-color", hexcolor(dc[0]), hexcolor(sc[0]), True))
+    if any(abs(x - y) > tol["px"] for x, y in zip(dr, sr)):
+        res.append(("border-radius", fmt4(dr), fmt4(sr), max(abs(x - y) for x, y in zip(dr, sr)) >= 3))
+    if (ds["box-shadow"] == "none") != (ss["box-shadow"] == "none"):
+        res.append(("box-shadow", "none" if ds["box-shadow"] == "none" else "yes",
+                    "none" if ss["box-shadow"] == "none" else "yes", True))
+    if d["kind"] != "text" or ds["display"] not in ("inline",):
+        if any(abs(x - y) > tol["px"] for x, y in zip(dp, sp)):
+            res.append(("padding", fmt4(dp), fmt4(sp), max(abs(x - y) for x, y in zip(dp, sp)) >= 4))
+    a, b = float(ds["opacity"] or 1), float(ss["opacity"] or 1)
+    if abs(a - b) > 0.05:
+        res.append(("opacity", f"{a:g}", f"{b:g}", True))
+    return res
+
+
+def norm_text(t):
+    return re.sub(r"\s+", " ", (t or "")).strip().lower()
+
+
+def sig(it):
+    if it["key"]:
+        return "k:" + it["key"]
+    if it["kind"] == "text":
+        return "t:" + norm_text(it["text"])
+    if it["kind"] == "img":
+        return "i:" + norm_text(it["alt"])
+    return "b:" + norm_text(it["full"])[:120] + f":{it['tag']}"
+
+
+def match_items(D, S, H_d, H_s):
+    pairs = {}
+    used_s = set()
+    # 1) exact signature, occurrences paired in document order
+    from collections import defaultdict
+    bd, bs = defaultdict(list), defaultdict(list)
+    for it in D:
+        bd[sig(it)].append(it)
+    for it in S:
+        bs[sig(it)].append(it)
+    for k, ds in bd.items():
+        if k.startswith("b::") or k == "i:":
+            continue  # boxes without text and images without alt: positional pass below
+        ss = bs.get(k, [])
+        for di, si in zip(ds, ss):
+            pairs[di["i"]] = si["i"]
+            used_s.add(si["i"])
+    # 2) the rest of the same kind: text similarity and position, in a window
+    rest_d = [it for it in D if it["i"] not in pairs]
+    rest_s = [it for it in S if it["i"] not in used_s]
+    cands = []
+    for di in rest_d:
+        for si in rest_s:
+            if di["kind"] != si["kind"]:
+                continue
+            ry = abs(di["y"] / max(H_d, 1) - si["y"] / max(H_s, 1))
+            if ry > 0.25:
+                continue
+            rx = abs(di["x"] - si["x"]) / 400
+            if di["kind"] == "text":
+                tr = difflib.SequenceMatcher(None, norm_text(di["text"]), norm_text(si["text"])).ratio()
+                same_tag = 0.1 if di["tag"] == si["tag"] else 0
+                same_font = 0.1 if di["st"]["font-size"] == si["st"]["font-size"] else 0
+                score = tr * 0.6 + same_tag + same_font + (0.2 - min(ry * 2 + rx * 0.2, 0.2))
+                if tr < 0.35 and score < 0.5:
+                    continue
+            else:
+                tr = difflib.SequenceMatcher(None, norm_text(di["full"] or di["alt"]),
+                                             norm_text(si["full"] or si["alt"])).ratio() if (di["full"] or si["full"] or di["alt"]) else 0.5
+                size = 1 - min(abs(di["w"] - si["w"]) / max(di["w"], si["w"], 1) + abs(di["h"] - si["h"]) / max(di["h"], si["h"], 1), 1)
+                score = tr * 0.4 + size * 0.3 + (0.3 - min(ry * 3 + rx * 0.3, 0.3))
+                if score < 0.55:
+                    continue
+            cands.append((score, di["i"], si["i"]))
+    cands.sort(reverse=True)
+    fuzzy = set()
+    for score, di, si in cands:
+        if di in pairs or si in used_s:
+            continue
+        pairs[di] = si
+        used_s.add(si)
+        fuzzy.add(di)
+    return pairs, fuzzy
+
+
+def short(t, n=40):
+    t = re.sub(r"\s+", " ", t or "").strip()
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+def label_of(it):
+    if it["kind"] == "text":
+        return f'{it["tag"]} "{short(it["text"])}"'
+    if it["kind"] == "img":
+        return f'{it["tag"]} [{short(it["alt"], 30) or "image"}]'
+    return f'{it["tag"]} box' + (f' "{short(it["full"], 30)}"' if it["full"] else "")
+
+
+def compare_items(D, S, fd, fs, tol):
+    H_d, H_s = fd["h"] or 1, fs["h"] or 1
+    pairs, fuzzy = match_items(D, S, H_d, H_s)
+    byi_s = {it["i"]: it for it in S}
+    issues = []
+    # previous matched element above, for vertical rhythm without a cascade from one shift
+    ordered = sorted((it for it in D if it["i"] in pairs), key=lambda it: (it["y"], it["x"]))
+    prev_of = {}
+    for k, it in enumerate(ordered):
+        for j in range(k - 1, -1, -1):
+            pv = ordered[j]
+            if pv["y"] + pv["h"] <= it["y"] + 1 and pv["depth"] <= it["depth"] + 2:
+                prev_of[it["i"]] = pv
+                break
+    for d in D:
+        if d["i"] not in pairs:
+            if d["kind"] == "box" and not d["full"] and d["w"] * d["h"] < 2500:
+                continue
+            issues.append(dict(type="missing", sev="!", d=d, s=None, props=[],
+                               where=(d["x"], d["y"], d["w"], d["h"])))
+            continue
+        s = byi_s[pairs[d["i"]]]
+        props = []
+        if d["i"] in fuzzy and d["kind"] == "text" and norm_text(d["text"]) != norm_text(s["text"]):
+            props.append(("text", f'"{short(d["text"], 30)}"', f'"{short(s["text"], 30)}"', False))
+        props += style_diffs(d, s, tol)
+        dw, dh = d["w"] - s["w"], d["h"] - s["h"]
+        if abs(dw) > tol["geo"]:
+            props.append(("width", str(d["w"]), str(s["w"]), abs(dw) >= 8))
+        if abs(dh) > tol["geo"]:
+            props.append(("height", str(d["h"]), str(s["h"]), abs(dh) >= 8))
+        if abs(d["x"] - s["x"]) > tol["geo"]:
+            props.append(("x", str(d["x"]), str(s["x"]), abs(d["x"] - s["x"]) >= 8))
+        pv = prev_of.get(d["i"])
+        if pv is not None:
+            ps = byi_s[pairs[pv["i"]]]
+            gd = d["y"] - (pv["y"] + pv["h"])
+            gs = s["y"] - (ps["y"] + ps["h"])
+            if abs(gd - gs) > tol["geo"]:
+                props.append(("gap-above", str(gd), str(gs), abs(gd - gs) >= 8))
+        if props:
+            major = any(p[3] for p in props)
+            issues.append(dict(type="diff", sev="!" if major else "~", d=d, s=s, props=props,
+                               where=(d["x"], d["y"], d["w"], d["h"])))
+    # geometry-only differences inside a box that already differs follow from it: fold them
+    GEO = {"width", "height", "x", "gap-above"}
+    byi_d = {it["i"]: it for it in D}
+    has_issue = {i["d"]["i"]: i for i in issues if i["d"] is not None}
+    for i in issues:
+        if i["type"] != "diff" or not all(p[0] in GEO for p in i["props"]):
+            continue
+        par = i["d"].get("par", -1)
+        while par is not None and par >= 0 and par not in pairs:
+            par = byi_d[par].get("par", -1)
+        host = has_issue.get(par)
+        if host is not None and host is not i:
+            i["folded"] = True
+            host["inner"] = host.get("inner", 0) + 1
+    issues = [i for i in issues if not i.get("folded")]
+    matched_s = set(pairs.values())
+    for s in S:
+        if s["i"] in matched_s:
+            continue
+        if s["kind"] == "box" and not s["full"] and s["w"] * s["h"] < 2500:
+            continue
+        issues.append(dict(type="extra", sev="~", d=None, s=s, props=[], where=(s["x"], s["y"], s["w"], s["h"])))
+    # nested duplicates: drop a "missing" box whose text is also reported missing inside it
+    issues.sort(key=lambda x: (x["sev"] != "!", {"missing": 0, "diff": 1, "extra": 2}[x["type"]], x["where"][1], x["where"][0]))
+    total = len([d for d in D if not (d["kind"] == "box" and not d["full"] and d["w"] * d["h"] < 2500)])
+    clean = total - len([i for i in issues if i["type"] in ("missing", "diff")])
+    return issues, pairs, (clean / total if total else 1.0)
+
+
+def issue_line(it):
+    if it["type"] == "missing":
+        d = it["d"]
+        return f'! missing  {label_of(d)}  @{d["x"]},{d["y"]} {d["w"]}x{d["h"]}'
+    if it["type"] == "extra":
+        s = it["s"]
+        return f'~ extra    {label_of(s)}  @{s["x"]},{s["y"]} {s["w"]}x{s["h"]}'
+    d = it["d"]
+    props = "  ".join(f"{p} {a}→{b}" for p, a, b, _ in it["props"])
+    inner = f'  (+{it["inner"]} inside moved)' if it.get("inner") else ""
+    return f'{it["sev"]} {label_of(d)}  @{d["x"]},{d["y"]}  {props}{inner}'
+
+
+def capture(page, frame_sel, path):
+    """Screenshot of the frame (or the whole page) in document coordinates."""
+    if frame_sel and frame_sel != "body":
+        box = page.evaluate("(sel) => { const e = document.querySelector(sel); const r = e.getBoundingClientRect();"
+                            " return {x: r.left + scrollX + e.clientLeft, y: r.top + scrollY + e.clientTop,"
+                            " width: e.clientWidth, height: e.clientHeight}; }", frame_sel)
+        page.screenshot(path=path, full_page=True, clip=box, animations="disabled")
+    else:
+        page.screenshot(path=path, full_page=True, animations="disabled")
+
+
+def pixel_diff(path_d, path_s, out_dir, items_d, thr=32, cell=8, max_regions=8):
+    from PIL import Image, ImageChops, ImageDraw
+    a = Image.open(path_d).convert("RGB")
+    b = Image.open(path_s).convert("RGB")
+    W, H = max(a.width, b.width), max(a.height, b.height)
+    pa = Image.new("RGB", (W, H), (255, 0, 255))
+    pb = Image.new("RGB", (W, H), (255, 0, 255))
+    pa.paste(a, (0, 0))
+    pb.paste(b, (0, 0))
+    dr_, dg_, db_ = ImageChops.difference(pa, pb).split()
+    diff = ImageChops.lighter(ImageChops.lighter(dr_, dg_), db_)
+    mask = diff.point(lambda v: 255 if v > thr else 0)
+    changed = mask.histogram()[255]
+    gw, gh = math.ceil(W / cell), math.ceil(H / cell)
+    small = mask.resize((gw, gh), Image.BOX)
+    gdata = small.load()
+    grid = [[gdata[x, y] > 10 for x in range(gw)] for y in range(gh)]
+    seen = [[False] * gw for _ in range(gh)]
+    regions = []
+    for y in range(gh):
+        for x in range(gw):
+            if not grid[y][x] or seen[y][x]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            x0 = x1 = x
+            y0 = y1 = y
+            n = 0
+            while stack:
+                cx, cy = stack.pop()
+                n += 1
+                x0, x1, y0, y1 = min(x0, cx), max(x1, cx), min(y0, cy), max(y1, cy)
+                for nx in range(cx - 2, cx + 3):
+                    for ny in range(cy - 2, cy + 3):
+                        if 0 <= nx < gw and 0 <= ny < gh and grid[ny][nx] and not seen[ny][nx]:
+                            seen[ny][nx] = True
+                            stack.append((nx, ny))
+            regions.append(dict(x=x0 * cell, y=y0 * cell, w=(x1 - x0 + 1) * cell, h=(y1 - y0 + 1) * cell, cells=n))
+    regions.sort(key=lambda r: -r["cells"])
+    regions = regions[:max_regions]
+    regions.sort(key=lambda r: (r["y"], r["x"]))
+    os.makedirs(out_dir, exist_ok=True)
+    # overlay: site, dimmed, changed pixels red
+    ov = pb.copy()
+    ov = Image.blend(ov, Image.new("RGB", ov.size, (255, 255, 255)), 0.55)
+    red = Image.new("RGB", ov.size, (230, 30, 30))
+    ov.paste(red, (0, 0), mask)
+    dr = ImageDraw.Draw(ov)
+    for k, r in enumerate(regions, 1):
+        dr.rectangle([r["x"], r["y"], r["x"] + r["w"], r["y"] + r["h"]], outline=(30, 90, 230), width=3)
+        dr.text((r["x"] + 4, r["y"] + 2), f"r{k}", fill=(30, 90, 230))
+    scale = min(1.0, 720 / W)
+    ov.resize((max(1, int(W * scale)), max(1, int(H * scale))), Image.LANCZOS).save(os.path.join(out_dir, "overlay.png"))
+    for k, r in enumerate(regions, 1):
+        pad = 24
+        box = (max(0, r["x"] - pad), max(0, r["y"] - pad), min(W, r["x"] + r["w"] + pad), min(H, r["y"] + r["h"] + pad))
+        ca, cb = pa.crop(box), pb.crop(box)
+        if ca.width > ca.height * 1.6:
+            sheet = Image.new("RGB", (ca.width, ca.height * 2 + 8), (255, 0, 255))
+            sheet.paste(ca, (0, 0))
+            sheet.paste(cb, (0, ca.height + 8))
+            r["layout"] = "design top, site bottom"
+        else:
+            sheet = Image.new("RGB", (ca.width * 2 + 8, ca.height), (255, 0, 255))
+            sheet.paste(ca, (0, 0))
+            sheet.paste(cb, (ca.width + 8, 0))
+            r["layout"] = "design left, site right"
+        if sheet.width > 900 or sheet.height > 900:
+            f = min(900 / sheet.width, 900 / sheet.height)
+            sheet = sheet.resize((max(1, int(sheet.width * f)), max(1, int(sheet.height * f))), Image.LANCZOS)
+        name = f"r{k}.png"
+        sheet.save(os.path.join(out_dir, name))
+        r["crop"] = name
+        r["tokens"] = image_tokens(sheet.width, sheet.height)
+        inside = [it for it in items_d if it["kind"] == "text"
+                  and it["x"] < r["x"] + r["w"] and it["x"] + it["w"] > r["x"]
+                  and it["y"] < r["y"] + r["h"] and it["y"] + it["h"] > r["y"]]
+        r["texts"] = [short(it["text"], 30) for it in inside[:3]]
+    return dict(percent=round(100 * changed / (W * H), 2), size=[W, H], design=[a.width, a.height],
+                site=[b.width, b.height], regions=regions)
+
+
+def cmd_compare(a):
+    from playwright.sync_api import sync_playwright
+    tol = dict(px=a.tol, geo=max(a.tol, 2), font=0.5, color=a.color_tol)
+    run = new_run(a.name or "compare")
+    themes = a.theme.split(",") if a.theme else ["light"]
+    widths = [int(x) for x in a.width.split(",")] if a.width else [None]
+    use_session = not a.site
+    image_design = bool(re.search(r"\.(png|jpe?g|webp)$", a.design, re.I))
+    if image_design and not os.path.exists(a.design):
+        die(f"no such image: {a.design}")
+    report = dict(version=VERSION, design=design_label(a.design), frame=a.frame, site=a.site or "session",
+                  site_frame=a.site_frame, created=dt.datetime.now().isoformat(timespec="seconds"), cells=[])
+    sess = None
+    code = 0
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        if use_session:
+            sess = Session(pw=p)
+        for theme in themes:
+            for width in widths:
+                if image_design:
+                    from PIL import Image
+                    im = Image.open(a.design).convert("RGB")
+                    if width and im.width != width:
+                        die(f"the design image is {im.width}px wide; compare it at --width {im.width}")
+                    width = im.width
+                    ed = {"items": [], "frame": {"x": 0, "y": 0, "w": im.width, "h": im.height}}
+                else:
+                    ctx = b.new_context(**context_options(width or 1440, 900, theme, a.locale))
+                    pd = ctx.new_page()
+                    load_static(pd, a.design, a.frame)
+                    ed = run_js(pd, JS_EXTRACT, {"frame": a.frame, "props": STYLE_PROPS})
+                    if ed.get("error"):
+                        die(ed["error"] + " (cdpm frames <design> lists them)")
+                    fw = ed["frame"]["w"]
+                    if width is None and a.frame:
+                        width = fw
+                        pd.set_viewport_size({"width": max(fw + ed["frame"]["x"] * 2, fw), "height": 900})
+                        pd.wait_for_timeout(200)
+                        snap_frame(pd, a.frame)
+                        ed = run_js(pd, JS_EXTRACT, {"frame": a.frame, "props": STYLE_PROPS})
+                width = width or 1440
+                cell = f"{width}-{theme}" if len(themes) > 1 else f"{width}"
+                cdir = os.path.join(run, cell)
+                os.makedirs(cdir, exist_ok=True)
+                if image_design:
+                    im.save(os.path.join(cdir, "design.png"))
+                else:
+                    capture(pd, a.frame, os.path.join(cdir, "design.png"))
+                    ctx.close()
+                # the site: a fresh page at the frame's width, or the live session tab
+                if use_session:
+                    s = load_session()
+                    old = (s["width"], s["height"], s.get("theme"))
+                    set_view(width, old[1], theme)
+                    ps = sess.page
+                    ps.add_style_tag(content=STOP_ANIM_CSS)
+                    settle(ps, 1500)
+                else:
+                    sctx = b.new_context(**context_options(width, 900, theme, a.locale))
+                    ps = sctx.new_page()
+                    try:
+                        ps.goto(normalize_url(a.site), wait_until="networkidle", timeout=45000)
+                    except Exception as e:
+                        if "Timeout" not in str(e):
+                            die(f"cannot open the site: {str(e).splitlines()[0][:160]}")
+                    ps.add_style_tag(content=STOP_ANIM_CSS)
+                    ps.evaluate("document.fonts ? document.fonts.ready.then(() => 1) : 1")
+                    ps.wait_for_timeout(300)
+                es = run_js(ps, JS_EXTRACT, {"frame": a.site_frame, "props": STYLE_PROPS})
+                if es.get("error"):
+                    die(es["error"])
+                capture(ps, a.site_frame, os.path.join(cdir, "site.png"))
+                if use_session:
+                    set_view(old[0], old[1], old[2])
+                else:
+                    sctx.close()
+                D, S = ed["items"], es["items"]
+                if image_design:
+                    issues, pairs, score = [], {}, 1.0
+                else:
+                    issues, pairs, score = compare_items(D, S, ed["frame"], es["frame"], tol)
+                px_res = pixel_diff(os.path.join(cdir, "design.png"), os.path.join(cdir, "site.png"),
+                                    os.path.join(cdir, "diff"), S if image_design else D)
+                n_missing = sum(1 for i in issues if i["type"] == "missing")
+                n_extra = sum(1 for i in issues if i["type"] == "extra")
+                n_diff = sum(1 for i in issues if i["type"] == "diff")
+                n_major = sum(1 for i in issues if i["sev"] == "!")
+                head = (f"== {cell}: {len(pairs)}/{len(D)} matched, {n_missing} missing, {n_extra} extra, "
+                        f"{n_diff} differ ({n_major} major), match {score:.0%}, pixels {px_res['percent']}% "
+                        f"(design {px_res['design'][0]}x{px_res['design'][1]}, site {px_res['site'][0]}x{px_res['site'][1]})")
+                if image_design:
+                    head = (f"== {cell}: pixels only (the design is an image) — {px_res['percent']}% differ "
+                            f"(design {px_res['design'][0]}x{px_res['design'][1]}, site {px_res['site'][0]}x{px_res['site'][1]})")
+                out(head)
+                lines = [issue_line(i) for i in issues]
+                for line in lines[:a.lines]:
+                    out(line)
+                if len(lines) > a.lines:
+                    out(f"… {len(lines) - a.lines} more in {rel(os.path.join(cdir, 'issues.txt'))}")
+                if px_res["regions"] and image_design:
+                    for k, r in enumerate(px_res["regions"], 1):
+                        out(f"r{k} @{r['x']},{r['y']} {r['w']}x{r['h']}  " + ", ".join(f'"{t}"' for t in r["texts"]))
+                elif px_res["regions"]:
+                    out("pixel regions: " + "  ".join(
+                        f"r{k} @{r['x']},{r['y']} {r['w']}x{r['h']}" for k, r in enumerate(px_res["regions"], 1)))
+                with open(os.path.join(cdir, "issues.txt"), "w") as f:
+                    f.write(head + "\n" + "\n".join(lines) + "\n")
+                cell_rep = dict(cell=cell, width=width, theme=theme, score=round(score, 3),
+                                matched=len(pairs), design_items=len(D), site_items=len(S),
+                                missing=n_missing, extra=n_extra, differ=n_diff, major=n_major,
+                                design_frame=ed["frame"], site_frame=es["frame"], pixels=px_res,
+                                issues=[dict(type=i["type"], sev=i["sev"], where=i["where"],
+                                             design=label_of(i["d"]) if i["d"] else None,
+                                             site=label_of(i["s"]) if i["s"] else None,
+                                             props=[list(p) for p in i["props"]]) for i in issues])
+                report["cells"].append(cell_rep)
+                if n_major or image_design and px_res["percent"] > 0.5:
+                    code = 1
+        if sess:
+            sess.close()
+        b.close()
+    with open(os.path.join(run, "report.json"), "w") as f:
+        json.dump(report, f, ensure_ascii=False, indent=1)
+    build_board(run)
+    out(f"run {rel(run)}  board: {rel(os.path.join(run, 'board.html'))}")
+    saved = sum(image_tokens(c["pixels"]["design"][0], min(c["pixels"]["design"][1], 4000)) * 2 for c in report["cells"])
+    record_stats("compare", saved)
+    return code
+
+
+# --- board -----------------------------------------------------------------------------------
+
+BOARD_CSS = """
+:root{--bg:#f6f5f2;--fg:#1b1b1b;--mut:#6b6b6b;--card:#fff;--line:#e2e0da;--bad:#c2341d;--warn:#a46a00;--ok:#2d7a3a;--acc:#2a62d6}
+@media (prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--mut:#9a9a9a;--card:#202020;--line:#333;--bad:#ff7a63;--warn:#e0b24a;--ok:#6fcf7f;--acc:#7aa2ff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,system-ui,sans-serif}
+header{padding:20px 24px;border-bottom:1px solid var(--line)}h1{font-size:18px;margin:0 0 4px}.mut{color:var(--mut)}
+section{padding:20px 24px;border-bottom:1px solid var(--line)}h2{font-size:16px;margin:0 0 8px}
+.kpi{display:flex;flex-wrap:wrap;gap:8px 20px;margin:6px 0 14px}.kpi b{font-variant-numeric:tabular-nums}
+.issues{font:12.5px/1.5 ui-monospace,Menlo,monospace;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;max-height:340px;overflow:auto;white-space:pre-wrap}
+.sev-major{color:var(--bad)}.sev-minor{color:var(--warn)}
+.cmp{position:relative;display:inline-block;max-width:100%;border:1px solid var(--line);background:#fff;overflow:hidden}
+.cmp img{display:block;max-width:100%;height:auto}.cmp .top{position:absolute;inset:0;overflow:hidden;border-right:2px solid var(--acc)}
+.cmp .top img{max-width:none}
+.ctl{display:flex;gap:12px;align-items:center;margin:10px 0}.ctl input{width:260px}
+.tabs button{font:inherit;padding:4px 10px;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;cursor:pointer}
+.tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+.crops{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px}.crops figure{margin:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px;max-width:100%}
+.crops img{max-width:100%;height:auto;display:block}figcaption{font-size:12px;color:var(--mut);margin-top:4px}
+.notes{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;white-space:pre-wrap}
+"""
+
+BOARD_JS = """
+document.querySelectorAll('[data-cell]').forEach(sec => {
+  const cmp = sec.querySelector('.cmp'), top = cmp.querySelector('.top'), base = cmp.querySelector('.base');
+  const topImg = top.querySelector('img'), range = sec.querySelector('input[type=range]');
+  const fit = () => { topImg.style.width = base.clientWidth + 'px'; };
+  base.addEventListener('load', fit); window.addEventListener('resize', fit); fit();
+  const set = v => { top.style.width = v + '%'; };
+  range.addEventListener('input', e => set(e.target.value)); set(range.value);
+  sec.querySelectorAll('.tabs button').forEach(btn => btn.addEventListener('click', () => {
+    sec.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x === btn));
+    const m = btn.dataset.mode;
+    sec.querySelector('.swipe').hidden = m !== 'swipe';
+    sec.querySelector('.ovl').hidden = m !== 'overlay';
+  }));
+});
+"""
+
+
+def build_board(run):
+    rep = json.load(open(os.path.join(run, "report.json")))
+    notes = ""
+    np_ = os.path.join(run, "notes.md")
+    if os.path.exists(np_):
+        notes = open(np_).read()
+    e = html.escape
+    parts = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+             f"<title>cdpm {e(os.path.basename(run))}</title><style>{BOARD_CSS}</style></head><body>",
+             f"<header><h1>Design vs site</h1><div class='mut'>design {e(rep['design'])}"
+             f"{' frame ' + e(rep['frame']) if rep.get('frame') else ''} · site {e(rep['site'])} · {e(rep['created'])}</div></header>"]
+    if notes:
+        parts.append(f"<section><h2>Verdict</h2><div class='notes'>{e(notes)}</div></section>")
+    for c in rep["cells"]:
+        cell = c["cell"]
+        lines = []
+        for i in c["issues"]:
+            cls = "sev-major" if i["sev"] == "!" else "sev-minor"
+            if i["type"] == "missing":
+                t = f"! missing  {i['design']}"
+            elif i["type"] == "extra":
+                t = f"~ extra    {i['site']}"
+            else:
+                t = f"{i['sev']} {i['design']}  " + "  ".join(f"{p} {x}→{y}" for p, x, y, _ in i["props"])
+            lines.append(f"<span class='{cls}'>{e(t)}</span>")
+        pxr = c["pixels"]
+        crops = "".join(
+            f"<figure><img src='{e(cell)}/diff/{e(r['crop'])}' loading='lazy'><figcaption>r{k} @{r['x']},{r['y']} {r['w']}×{r['h']} · {e(r['layout'])}"
+            f"{' · ' + e(', '.join(r['texts'])) if r.get('texts') else ''}</figcaption></figure>"
+            for k, r in enumerate(pxr["regions"], 1))
+        parts.append(
+            f"<section data-cell='{e(cell)}'><h2>{e(cell)} px{' · ' + e(c['theme']) if c['theme'] != 'light' else ''}</h2>"
+            f"<div class='kpi'><span>match <b>{c['score']:.0%}</b></span><span>matched <b>{c['matched']}/{c['design_items']}</b></span>"
+            f"<span>missing <b>{c['missing']}</b></span><span>extra <b>{c['extra']}</b></span><span>differ <b>{c['differ']}</b> ({c['major']} major)</span>"
+            f"<span>pixels <b>{pxr['percent']}%</b></span></div>"
+            f"<div class='issues'>{chr(10).join(lines) or 'no differences'}</div>"
+            f"<div class='ctl tabs'><button class='on' data-mode='swipe'>Swipe: design ◀ ▶ site</button><button data-mode='overlay'>Diff overlay</button>"
+            f"<input type='range' min='0' max='100' value='50' aria-label='swipe position'></div>"
+            f"<div class='swipe'><div class='cmp'><img class='base' src='{e(cell)}/site.png'><div class='top'><img src='{e(cell)}/design.png'></div></div></div>"
+            f"<div class='ovl' hidden><img src='{e(cell)}/diff/overlay.png' style='max-width:100%'></div>"
+            f"<div class='crops'>{crops}</div></section>")
+    parts.append(f"<script>{BOARD_JS}</script></body></html>")
+    with open(os.path.join(run, "board.html"), "w") as f:
+        f.write("".join(parts))
+
+
+def cmd_board(a):
+    run = find_run(a.run)
+    if not os.path.exists(os.path.join(run, "report.json")):
+        die(f"no report.json in {rel(run)}")
+    build_board(run)
+    path = os.path.join(run, "board.html")
+    out(rel(path))
+    if a.open:
+        subprocess.run(["open", path])
+    return 0
+
+
+def cmd_thumb(a):
+    from PIL import Image
+    global _IMAGES
+    src = a.image
+    im = Image.open(src)
+    if a.crop:
+        x0, y0, x1, y1 = [int(v) for v in a.crop.split(",")]
+        im = im.crop((x0, y0, x1, y1))
+    elif im.width > a.width:
+        im = im.resize((a.width, max(1, round(im.height * a.width / im.width))), Image.LANCZOS)
+    if im.height > 2000:
+        im = im.crop((0, 0, im.width, 2000))
+    d = os.path.join(os.path.dirname(os.path.abspath(src)), "thumbs")
+    os.makedirs(d, exist_ok=True)
+    base = os.path.splitext(os.path.basename(src))[0]
+    path = os.path.join(d, f"{base}-{a.crop.replace(',', '_') if a.crop else a.width}.png")
+    im.convert("RGB").save(path)
+    _IMAGES += 1
+    out(f"{rel(path)}  {im.width}x{im.height} ~{image_tokens(im.width, im.height)} tokens")
+    return 0
+
+
+# --- status, clean, doctor -------------------------------------------------------------------
+
+def cmd_status(a):
+    path = os.path.join(cache_dir(), "stats.jsonl")
+    rows = []
+    try:
+        with open(path) as f:
+            rows = [json.loads(x) for x in f if x.strip()]
+    except (OSError, ValueError):
+        pass
+    s = load_session()
+    if s and alive(s.get("pid")):
+        out(f"browser: pid {s['pid']}, {s['width']}x{s['height']} {s.get('theme')}, since {s.get('started')}")
+    else:
+        out("browser: not running")
+    if not rows:
+        out("no calls recorded yet")
+        return 0
+    by = {}
+    for r in rows:
+        b = by.setdefault(r["cmd"], [0, 0, 0, 0])
+        b[0] += 1
+        b[1] += r.get("tokens", 0)
+        b[2] += r.get("images", 0)
+        b[3] += r.get("saved", 0)
+    out(f"{'command':<10}{'calls':>7}{'tokens':>9}{'images':>8}{'saved':>10}")
+    tot = [0, 0, 0, 0]
+    for k, v in sorted(by.items(), key=lambda kv: -kv[1][1]):
+        out(f"{k:<10}{v[0]:>7}{v[1]:>9,}{v[2]:>8}{v[3]:>10,}")
+        tot = [x + y for x, y in zip(tot, v)]
+    out(f"{'total':<10}{tot[0]:>7}{tot[1]:>9,}{tot[2]:>8}{tot[3]:>10,}")
+    out("saved: rough estimate — each ui/click replaces a viewport screenshot, compare two full frames")
+    return 0
+
+
+def cmd_clean(a):
+    base = cache_dir()
+    runs = sorted(x for x in os.listdir(base) if re.match(r"\d{8}-\d{6}-", x))
+    keep = runs[-a.keep:] if a.keep else []
+    gone = [r for r in runs if r not in keep]
+    for r in gone:
+        shutil.rmtree(os.path.join(base, r), ignore_errors=True)
+    for sub in ("look", "shots"):
+        if a.all:
+            shutil.rmtree(os.path.join(base, sub), ignore_errors=True)
+    out(f"removed {len(gone)} runs, kept {len(keep)}")
+    return 0
+
+
+def cmd_doctor(a):
+    ok = True
+    out(f"cdpm {VERSION}, python {sys.version.split()[0]} ({sys.executable})")
+
+    def has(mod):
+        try:
+            __import__(mod)
+            return True
+        except ImportError:
+            return False
+    py = sys.executable
+    pw, pil = has("playwright"), has("PIL")
+    if (not pw or not pil) and os.path.exists(VENV_PY):
+        r = subprocess.run([VENV_PY, "-c", "import playwright, PIL"], capture_output=True)
+        if r.returncode == 0:
+            py, pw, pil = VENV_PY, True, True
+    if (not pw or not pil) and a.install:
+        out(f"installing into {VENV} …")
+        if not os.path.exists(VENV_PY):
+            subprocess.run([sys.executable, "-m", "venv", VENV], check=True)
+        subprocess.run([VENV_PY, "-m", "pip", "install", "-q", "--upgrade", "pip", "playwright", "pillow"], check=True)
+        py, pw, pil = VENV_PY, True, True
+    out(f"playwright: {'ok' if pw else 'MISSING'}   pillow: {'ok' if pil else 'MISSING'}   python for cdpm: {py}")
+    ok = pw and pil
+    if pw:
+        r = subprocess.run([py, "-c", "from playwright.sync_api import sync_playwright\n"
+                                      "with sync_playwright() as p:\n b = p.chromium.launch(); print(b.version); b.close()"],
+                           capture_output=True, text=True)
+        if r.returncode != 0 and a.install:
+            subprocess.run([py, "-m", "playwright", "install", "chromium"], check=True)
+            r = subprocess.run([py, "-c", "from playwright.sync_api import sync_playwright\n"
+                                          "with sync_playwright() as p:\n b = p.chromium.launch(); print(b.version); b.close()"],
+                               capture_output=True, text=True)
+        if r.returncode == 0:
+            out(f"chromium: {r.stdout.strip()}")
+        else:
+            ok = False
+            out("chromium: MISSING (cdpm doctor --install)")
+    out(f"project: {project_root()}  runs: {rel(cache_dir())}")
+    gi = os.path.join(project_root(), ".gitignore")
+    if os.path.exists(os.path.join(project_root(), ".git")):
+        r = subprocess.run(["git", "-C", project_root(), "check-ignore", "-q", "build/cdpm/x"])
+        if r.returncode != 0:
+            out(f"! build/cdpm is not ignored by git: add 'build/' to {rel(gi)}")
+    if not ok and not a.install:
+        out("run: cdpm doctor --install")
+    return 0 if ok else 1
+
+
+# --- CLI -------------------------------------------------------------------------------------
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="cdpm", description="Deterministic browser control and design checks for an agent.")
+    p.add_argument("--version", action="version", version=f"cdpm {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help_, aliases=()):
+        sp = sub.add_parser(name, help=help_, aliases=list(aliases))
+        sp.set_defaults(fn=fn, _cmd=name)
+        return sp
+
+    sp = add("open", cmd_open, "start the browser (if needed) and open a URL; prints the page as text")
+    sp.add_argument("url")
+    sp.add_argument("--size", help="viewport WIDTHxHEIGHT, default 1280x900")
+    sp.add_argument("--theme", choices=["light", "dark"])
+    sp.add_argument("--locale")
+    sp.add_argument("--max", type=int, default=150)
+    sp.add_argument("-q", "--quiet", action="store_true", help="do not print the page")
+
+    sp = add("goto", cmd_goto, "open a URL in the current tab")
+    sp.add_argument("url")
+    sp.add_argument("--max", type=int, default=150)
+    sp.add_argument("-q", "--quiet", action="store_true")
+
+    sp = add("ui", cmd_ui, "the visible page as compact text; interactive elements get @eN refs")
+    sp.add_argument("--all", action="store_true", help="the whole page, not only the viewport")
+    sp.add_argument("--find", help="only lines containing this text")
+    sp.add_argument("--href", action="store_true", help="show link targets")
+    sp.add_argument("--max", type=int, default=150)
+
+    sp = add("click", cmd_click, "click by text, @ref or css=…; reports what changed", aliases=["tap"])
+    sp.add_argument("target")
+    sp.add_argument("--expect", help="text that must appear after the click")
+    sp.add_argument("--timeout", type=float, default=8)
+
+    sp = add("type", cmd_type, "type text into the focused element or --into a field")
+    sp.add_argument("text")
+    sp.add_argument("--into", help="field: text, @ref or css=…")
+    sp.add_argument("--enter", action="store_true", help="press Enter after typing")
+
+    sp = add("key", cmd_key, "press a key: Enter, Escape, Tab, ArrowDown, Meta+a …")
+    sp.add_argument("key")
+
+    sp = add("hover", cmd_hover, "hover an element")
+    sp.add_argument("target")
+
+    sp = add("scroll", cmd_scroll, "scroll down|up|top|bottom or to an element")
+    sp.add_argument("where", nargs="?", default="down")
+
+    add("back", cmd_back, "history back")
+    add("reload", cmd_reload, "reload the page")
+
+    sp = add("wait", cmd_wait, "wait until a text is on the page: exit code 0 or 1")
+    sp.add_argument("text")
+    sp.add_argument("--timeout", type=float, default=8)
+
+    sp = add("assert", cmd_assert, "is a text on the page now: exit code 0 or 1")
+    sp.add_argument("text")
+
+    sp = add("batch", cmd_batch, "several steps in one call, each in its own quotes")
+    sp.add_argument("steps", nargs="+")
+    sp.add_argument("--keep-going", action="store_true")
+    sp.add_argument("--ui", action="store_true", help="print the page after the steps")
+    sp.add_argument("--max", type=int, default=150)
+
+    sp = add("view", cmd_view, "change viewport size and theme of the running browser")
+    sp.add_argument("size", nargs="?")
+    sp.add_argument("--theme", choices=["light", "dark"])
+
+    sp = add("tabs", cmd_tabs, "list tabs, --switch N")
+    sp.add_argument("--switch", type=int)
+
+    sp = add("log", cmd_log, "console messages, page errors, failed and 4xx/5xx requests")
+    sp.add_argument("--errors", action="store_true", help="errors and warnings only")
+    sp.add_argument("--grep")
+    sp.add_argument("--since", type=float, help="minutes")
+    sp.add_argument("--max", type=int, default=40)
+    sp.add_argument("--clear", action="store_true")
+
+    sp = add("style", cmd_style, "computed styles and box of an element")
+    sp.add_argument("target")
+    sp.add_argument("--props", help="comma-separated CSS properties")
+
+    sp = add("eval", cmd_eval, "evaluate a JS expression in the page")
+    sp.add_argument("js")
+    sp.add_argument("--max-chars", type=int, default=2000)
+
+    sp = add("look", cmd_look, "a downscaled screenshot for the agent (path + token cost)")
+    sp.add_argument("target", nargs="?", help="element: text, @ref or css=…")
+    sp.add_argument("--full", action="store_true")
+    sp.add_argument("--crop", help="x0,y0,x1,y1 in page pixels")
+    sp.add_argument("--width", type=int, default=640)
+
+    sp = add("shot", cmd_shot, "a full-size screenshot for the person")
+    sp.add_argument("name")
+    sp.add_argument("--viewport", action="store_true")
+
+    add("close", cmd_close, "stop the browser")
+
+    sp = add("frames", cmd_frames, "list frames of a design (Claude Design canvas options)")
+    sp.add_argument("design", help="URL or HTML file")
+
+    sp = add("pull", cmd_pull, "save a rendered design URL to a local folder (no token kept)")
+    sp.add_argument("design")
+    sp.add_argument("--out", default="design")
+    sp.add_argument("--name")
+
+    sp = add("compare", cmd_compare, "check the site against the design: styles, geometry, pixels")
+    sp.add_argument("--design", required=True, help="design URL or HTML file")
+    sp.add_argument("--frame", help="CSS selector of the design frame (cdpm frames)")
+    sp.add_argument("--site", help="site URL; without it, the current tab of the running browser")
+    sp.add_argument("--site-frame", help="CSS selector of the compared part of the site")
+    sp.add_argument("--width", help="viewport widths, comma-separated; default the frame width")
+    sp.add_argument("--theme", help="light,dark")
+    sp.add_argument("--locale", default="en-US")
+    sp.add_argument("--name")
+    sp.add_argument("--tol", type=float, default=1, help="px tolerance for styles (geometry: at least 2)")
+    sp.add_argument("--color-tol", type=float, default=6)
+    sp.add_argument("--lines", type=int, default=40)
+
+    sp = add("board", cmd_board, "rebuild the HTML board of a run (picks up notes.md)")
+    sp.add_argument("run", nargs="?")
+    sp.add_argument("--open", action="store_true")
+
+    sp = add("thumb", cmd_thumb, "downscaled copy or 1:1 crop of a run image")
+    sp.add_argument("image")
+    sp.add_argument("--crop")
+    sp.add_argument("--width", type=int, default=540)
+
+    add("status", cmd_status, "browser state and token accounting")
+
+    sp = add("clean", cmd_clean, "delete old runs")
+    sp.add_argument("--keep", type=int, default=3)
+    sp.add_argument("--all", action="store_true", help="also look/ and shots/")
+
+    sp = add("doctor", cmd_doctor, "check (and --install) Playwright, Chromium, Pillow")
+    sp.add_argument("--install", action="store_true")
+
+    sp = sub.add_parser("_daemon")
+    sp.set_defaults(fn=cmd_daemon, _cmd="_daemon")
+
+    a = p.parse_args(argv)
+    try:
+        code = a.fn(a)
+    except KeyboardInterrupt:
+        code = 130
+    if a._cmd not in ("_daemon", "compare", "doctor", "status"):
+        saved = 0
+        if a._cmd in ("ui", "click", "open", "goto", "batch"):
+            s = load_session() or {}
+            saved = image_tokens(s.get("width", 1280), s.get("height", 900))
+        record_stats(a._cmd, saved)
+    return code or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

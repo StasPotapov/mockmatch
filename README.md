@@ -74,7 +74,20 @@ which does the same for Android.
 
 Requires Python 3.9+. macOS is tested; Linux should work.
 
-**From a clone.** The skill and the agent are symlinks; the hook goes into `~/.claude/settings.json`.
+**As a Claude Code plugin** (recommended): skill, agent and hook in one step.
+
+```
+/plugin marketplace add StasPotapov/sp-tools
+/plugin install cdpm@sp-tools
+```
+
+The skill is then called `/cdpm:cdpm`. Then ask the agent to run `cdpm doctor --install`: it creates a venv
+with Playwright, Pillow and Chromium in `~/.local/share/cdpm`, outside the plugin cache, so updates keep it.
+To get a new version: `/plugin marketplace update sp-tools`, then `claude plugin update cdpm@sp-tools`
+(in the shell).
+
+**From a clone.** Pick one way: with both, the skill and the hook load twice.
+The skill and the agent are symlinks; the hook goes into `~/.claude/settings.json`.
 
 ```bash
 git clone https://github.com/StasPotapov/cdpm.git ~/dev/cdpm
@@ -90,9 +103,6 @@ under `hooks.PreToolUse`:
 { "matcher": "Read", "hooks": [{ "type": "command",
   "command": "f=~/.claude/skills/cdpm/hooks/cdpm-guard.py; [ -f \"$f\" ] || exit 0; exec python3 \"$f\"" }] }
 ```
-
-**As a Claude Code plugin.** The repository is also a plugin (`.claude-plugin/`): skill, agent and hook in
-one step. Then run `cdpm doctor --install` through the agent.
 
 `build/cdpm/` in the project holds runs, screenshots and the browser state: add `build/` to `.gitignore`.
 `cdpm doctor` warns when it is not ignored.
@@ -115,7 +125,7 @@ on `tests/fixtures/` and drive the session.
 - `skill/agents/cdpm-eyes.md` — the verdict subagent.
 - `skill/hooks/` — the guard hook and its plugin config.
 - `tests/` — pytest and HTML fixtures.
-- `docs/alternatives.md` — similar tools and why cdpm exists.
+- `docs/alternatives.md` — similar tools and why cdpm exists ([Russian](docs/alternatives.ru.md)).
 
 ## License
 

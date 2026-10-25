@@ -75,7 +75,20 @@
 
 Нужен Python 3.9+. Проверено на macOS; на Linux должно работать.
 
-**Из клона.** Скилл и агент подключаются симлинками, хук — записью в `~/.claude/settings.json`.
+**Как плагин Claude Code** (рекомендуется): скилл, агент и хук ставятся одним шагом.
+
+```
+/plugin marketplace add StasPotapov/sp-tools
+/plugin install cdpm@sp-tools
+```
+
+Скилл тогда называется `/cdpm:cdpm`. Затем попроси агента выполнить `cdpm doctor --install`: он создаст venv
+с Playwright, Pillow и Chromium в `~/.local/share/cdpm`. Этот каталог лежит вне кэша плагина, поэтому
+обновление его не стирает. Новая версия: `/plugin marketplace update sp-tools`,
+затем `claude plugin update cdpm@sp-tools` (в терминале).
+
+**Из клона.** Выбери один способ: с обоими скилл и хук загрузятся дважды.
+Скилл и агент подключаются симлинками, хук — записью в `~/.claude/settings.json`.
 
 ```bash
 git clone https://github.com/StasPotapov/cdpm.git ~/dev/cdpm
@@ -91,9 +104,6 @@ ln -s ~/dev/cdpm/skill/agents/cdpm-eyes.md ~/.claude/agents/cdpm-eyes.md
 { "matcher": "Read", "hooks": [{ "type": "command",
   "command": "f=~/.claude/skills/cdpm/hooks/cdpm-guard.py; [ -f \"$f\" ] || exit 0; exec python3 \"$f\"" }] }
 ```
-
-**Как плагин Claude Code.** Репозиторий — ещё и плагин (`.claude-plugin/`): скилл, агент и хук ставятся
-одним шагом. Затем попроси агента выполнить `cdpm doctor --install`.
 
 В проекте `build/cdpm/` хранит прогоны, скриншоты и состояние браузера: добавь `build/` в `.gitignore`.
 `cdpm doctor` предупредит, если каталог не игнорируется.
@@ -116,7 +126,7 @@ ln -s ~/dev/cdpm/skill/agents/cdpm-eyes.md ~/.claude/agents/cdpm-eyes.md
 - `skill/agents/cdpm-eyes.md` — субагент-вердикт.
 - `skill/hooks/` — хук-сторож и его конфиг для плагина.
 - `tests/` — pytest и HTML-фикстуры.
-- `docs/alternatives.md` — похожие инструменты и зачем нужен cdpm.
+- `docs/alternatives.ru.md` — похожие инструменты и зачем нужен cdpm.
 
 ## Лицензия
 

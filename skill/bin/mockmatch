@@ -1181,6 +1181,56 @@ def design_label(src):
     return rel(os.path.abspath(src))
 
 
+CLAUDE_DESIGN_MCP = "claude_design"
+CLAUDE_DESIGN_URL = "https://api.anthropic.com/v1/design/mcp"
+
+
+def design_project_id(value):
+    """A Claude Design project id from an id or an editor link claude.ai/design/p/<id>."""
+    m = re.search(r"/design/p/([0-9a-fA-F-]{8,})", value or "")
+    return m.group(1) if m else (value or "").strip() or None
+
+
+def claude_design_status():
+    """Is the Claude Design MCP added and logged in: (state, message).
+
+    state: connected | auth (added, not logged in) | missing (not added) | failed | unknown
+    (no `claude` CLI). Asks `claude mcp get`, which runs the server's health check (~2 s)."""
+    exe = shutil.which("claude")
+    if not exe:
+        return "unknown", "the claude CLI is not in PATH, cannot check"
+    try:
+        r = subprocess.run([exe, "mcp", "get", CLAUDE_DESIGN_MCP], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "unknown", f"claude mcp get failed: {e}"
+    return parse_mcp_status(r.returncode, r.stdout + r.stderr)
+
+
+def parse_mcp_status(code, text):
+    add = f"claude mcp add --transport http -s user {CLAUDE_DESIGN_MCP} {CLAUDE_DESIGN_URL}"
+    login = f"in Claude Code: /mcp → {CLAUDE_DESIGN_MCP} → Authenticate"
+    if code != 0 and re.search(r"No MCP server", text, re.I):
+        return "missing", f"not added — run `{add}`, then {login}"
+    status = next((ln.split(":", 1)[1].strip() for ln in text.splitlines()
+                   if ln.strip().lower().startswith("status:")), "")
+    if re.search(r"\bconnected\b", status, re.I) and not re.search(r"not|fail|dis", status, re.I):
+        return "connected", "connected"
+    if re.search(r"auth|login|token|401|403", status + text, re.I):
+        return "auth", f"not logged in ({status or 'needs authentication'}) — {login}"
+    return "failed", f"{status or 'unknown status'} — check the network, then {login}"
+
+
+def design_meta(path):
+    """design.json written by `pull` next to a design file, or None."""
+    if re.match(r"^https?://", path or ""):
+        return None
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(path)), "design.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def cmd_frames(a):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
@@ -1189,6 +1239,9 @@ def cmd_frames(a):
         load_static(pg, a.design)
         r = pg.evaluate(JS_FRAMES)
         b.close()
+    cd = (design_meta(a.design) or {}).get("claude_design")
+    if cd:
+        out(f"source: Claude Design project {cd['project']}  file {cd['file']}  pulled {design_meta(a.design).get('pulled')}")
     if r["canvas"]:
         out(f"Claude Design canvas: {len(r['frames'])} frames")
     for f in r["frames"]:
@@ -1277,11 +1330,28 @@ def cmd_pull(a):
         with open(dst, "wb") as f:
             f.write(body)
         saved.append(path)
+    meta = {"source": redact(src), "pulled": dt.datetime.now().isoformat(timespec="seconds"), "files": saved}
+    cd = claude_design_source(a, out_dir, name)
+    if cd:
+        meta["claude_design"] = cd
     with open(os.path.join(out_dir, "design.json"), "w") as f:
-        json.dump({"source": redact(src), "pulled": dt.datetime.now().isoformat(timespec="seconds"),
-                   "files": saved}, f, ensure_ascii=False, indent=1)
+        json.dump(meta, f, ensure_ascii=False, indent=1)
     out(f"pulled {design_label(src)} -> {rel(os.path.join(out_dir, name))} (+{len(saved) - 1} files, scripts removed)")
     return 0
+
+
+def claude_design_source(a, out_dir, name):
+    """Where the design lives in Claude Design: --project/--file, else what the last pull of the same
+    file recorded. It is what a later pull needs to refresh the copy (render_preview of the project file)."""
+    project = design_project_id(a.project)
+    if project:
+        file = a.file or urllib.parse.parse_qs(urllib.parse.urlsplit(a.project).query).get("file", [None])[0]
+        url = f"https://claude.ai/design/p/{project}" + (f"?file={urllib.parse.quote_plus(file)}" if file else "")
+        return {"project": project, "file": file, "url": url}
+    old = design_meta(os.path.join(out_dir, name)) or {}
+    if name in old.get("files", [])[:1]:
+        return old.get("claude_design")
+    return None
 
 
 # --- compare: design vs site -----------------------------------------------------------------
@@ -2020,8 +2090,12 @@ def cmd_doctor(a):
         r = subprocess.run(["git", "-C", project_root(), "check-ignore", "-q", "build/mockmatch/x"])
         if r.returncode != 0:
             out(f"! build/mockmatch is not ignored by git: add 'build/' to {rel(gi)}")
+    state, msg = claude_design_status()
+    out(f"claude design: {msg}" + ("" if state == "connected" else "  (needed only for designs in Claude Design)"))
+    if a.design and state != "connected":
+        ok = False
     if not ok and not a.install:
-        out("run: mockmatch doctor --install")
+        out("run: mockmatch doctor --install" if not (pw and pil) else "fix the lines above and run doctor again")
     return 0 if ok else 1
 
 
@@ -2132,6 +2206,8 @@ def main(argv=None):
     sp.add_argument("design")
     sp.add_argument("--out", default="design")
     sp.add_argument("--name")
+    sp.add_argument("--project", help="Claude Design project id or its claude.ai/design/p/<id>?file=… link, kept in design.json")
+    sp.add_argument("--file", help="the file path inside the Claude Design project, kept in design.json")
 
     sp = add("compare", cmd_compare, "check the site against the design: styles, geometry, pixels")
     sp.add_argument("--design", required=True, help="design URL or HTML file")
@@ -2161,8 +2237,9 @@ def main(argv=None):
     sp.add_argument("--keep", type=int, default=3)
     sp.add_argument("--all", action="store_true", help="also look/ and shots/")
 
-    sp = add("doctor", cmd_doctor, "check (and --install) Playwright, Chromium, Pillow")
+    sp = add("doctor", cmd_doctor, "check (and --install) Playwright, Chromium, Pillow; the Claude Design login")
     sp.add_argument("--install", action="store_true")
+    sp.add_argument("--design", action="store_true", help="fail when Claude Design is not connected")
 
     sp = sub.add_parser("_daemon")
     sp.set_defaults(fn=cmd_daemon, _cmd="_daemon")

@@ -32,7 +32,8 @@ substituted, take the folder from the "Base directory for this skill" line. Run 
 project root: files go to `<project>/build/mockmatch/`. The project is the git root of the current folder;
 `MOCKMATCH_PROJECT=<path>` overrides it. Help: `"$MOCKMATCH" <command> -h`. Commands below omit the prefix; set the
 variable in every Bash call (it does not persist). First use on a machine: `doctor`, and if it reports
-something missing, `doctor --install` (a private venv with Playwright, Chromium and Pillow).
+something missing, `doctor --install` (a private venv with Playwright, Chromium and Pillow). `doctor` also
+checks that the Claude Design MCP is added and logged in; `doctor --design` fails when it is not.
 
 ## Browser control
 
@@ -62,10 +63,23 @@ did nothing visible.
 
 Read `reference/design-check.md` before the first `compare` in a session. The short path:
 
-1. **Get the design.** Claude Design: `mcp__claude_design__render_preview` gives a `serve_url` that
-   lives an hour. Save it locally once: `pull "<serve_url>" --out design` (the token is not kept). Never
-   write the `serve_url` into files or show it to the person. An HTML mockup or a PNG in the repository
-   works as is.
+1. **Get the design.** Find where it lives, in this order:
+   - `design/design.json` (written by `pull`) has `claude_design` — the project and file of an earlier
+     pull. Refresh from them: the person may have changed the design since.
+   - The person gave a Claude Design link `claude.ai/design/p/<id>?file=…` — the project id and file.
+   - The task or the spec names a design file in the repository (an HTML mockup or a PNG) — use it as is.
+   - Otherwise `mcp__claude_design__list_projects`, then `list_files`; ask the person which project
+     and file if it is not clear.
+
+   Claude Design needs its MCP logged in. The first `claude_design` call in a session is the check:
+   the tools are missing or the call fails with an auth error — stop and tell the person to log in
+   (`/mcp` → `claude_design` → Authenticate; `doctor` prints the exact step). A saved copy in
+   `design/` still works without the login: say that it may be stale.
+
+   Pull a Claude Design file: `render_preview(project_id, path)` gives a `serve_url` that lives an hour.
+   `pull "<serve_url>" --out design --project <project_id> --file "<path>"` saves it without the token and
+   keeps the project and file in `design/design.json` for the next refresh. Never write the `serve_url`
+   into files or show it to the person; the link for the person is `open_url`.
 2. **Pick the frame.** `frames design/<file>.html` lists the canvas options with sizes and a `--frame`
    selector. Ask the person which option is the one to build if it is not clear.
 3. **Compare.** With the site open in the browser (`open …`):

@@ -16,10 +16,28 @@ and the frame snapped to whole pixels. Then it does two passes:
 
 | Source | How |
 |---|---|
-| Claude Design | `render_preview` (MCP `claude_design`) → `serve_url`, then `mockmatch pull "<serve_url>" --out design`. The URL holds a token and lives ~1 hour: do not write it into files, do not show it. `pull` saves the rendered page without scripts and the token; commit `design/` so the check repeats without the MCP. |
+| Claude Design | `render_preview(project_id, path)` (MCP `claude_design`) → `serve_url`, then `mockmatch pull "<serve_url>" --out design --project <project_id> --file "<path>"`. The URL holds a token and lives ~1 hour: do not write it into files, do not show it. `pull` saves the rendered page without scripts and the token; commit `design/` so the check repeats without the MCP. |
 | HTML mockup in the repo | `--design path/to/mockup.html` as is |
 | A live URL | `--design https://…` (for example the old version of the site) |
 | PNG / JPG | `--design mock.png`: pixels only, no element lines; the viewport width is the image width |
+
+### Where a Claude Design file comes from
+
+`design/design.json` remembers it: `pull --project --file` writes `claude_design` with the project id,
+the file path and the editor link (`url`, safe to show). A later `pull` into the same folder and name
+keeps it. `mockmatch frames design/<file>.html` prints it as the `source:` line. To refresh the copy, call
+`render_preview` with that project and file and `pull` again. A project link from the person
+(`claude.ai/design/p/<id>?file=…`) works as `--project` as is: the file is taken from `file=`.
+
+### Login
+
+The `claude_design` MCP is an HTTP server with its own login. `mockmatch doctor` asks `claude mcp get
+claude_design` and prints one of: connected; not added (the `claude mcp add` command); not logged in
+(`/mcp` → `claude_design` → Authenticate); failed. `doctor --design` exits 1 unless connected — use it
+before an unattended run that pulls from Claude Design. Inside a session the first `claude_design`
+call answers the same question: missing tools or an auth error mean "not logged in".
+
+### Canvases
 
 Claude Design files are canvases: one file holds several options side by side (`1a`, `1b`, …), each a
 fixed-width card. `mockmatch frames design/<file>.html` lists them:

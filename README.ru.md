@@ -34,6 +34,7 @@
   `reload`, `view` (размер окна и тема), `tabs`, `log` (ошибки консоли, упавшие запросы и ответы 4xx/5xx),
   `style` (вычисленные стили), `eval`, `look` (скриншот 640 px для агента), `shot` (полный размер, для тебя).
 - **Источники дизайна.** `pull` сохраняет отрисованный файл Claude Design локально, без токена доступа.
+  Проект и файл он записывает в `design/design.json`, поэтому следующая проверка обновит дизайн из того же места.
   `frames` перечисляет варианты на холсте Claude Design и даёт готовый селектор `--frame`.
 - **Сверка с дизайном.** `compare` сопоставляет элементы по `data-mockmatch`, по точному тексту, затем
   по похожему тексту и положению. В каждой паре он сравнивает шрифт, размер, начертание, высоту строки,
@@ -48,8 +49,9 @@
 
 ## Как идёт сверка с дизайном
 
-1. **Дизайн.** Агент получает ссылку превью на файл Claude Design (`render_preview` из MCP `claude_design`).
-   Затем он сохраняет дизайн командой `mockmatch pull` и выбирает вариант через `mockmatch frames`.
+1. **Дизайн.** Агент берёт проект и файл из `design/design.json`, из твоей ссылки `claude.ai/design/p/…`
+   или из списка проектов MCP `claude_design`. Он получает ссылку превью (`render_preview`) и сохраняет
+   файл командой `mockmatch pull --project … --file …`. Затем он выбирает вариант через `mockmatch frames`.
 2. **Сайт.** `mockmatch open http://localhost:5173` выводит страницу дев-сервера текстом.
 3. **Сверка.** `mockmatch compare --design design/page.html --frame '[id="1b"] .dv-card'` выводит строки:
 
@@ -86,6 +88,11 @@
 с Playwright, Pillow и Chromium в `~/.local/share/mockmatch`. Этот каталог лежит вне кэша плагина, поэтому
 обновление его не стирает. Новая версия: `/plugin marketplace update sp-tools`,
 затем `claude plugin update mockmatch@sp-tools` (в терминале).
+
+**Claude Design.** Дизайн из Claude Design приходит через MCP `claude_design`, а у него свой вход.
+`mockmatch doctor` показывает, подключён ли он и что сделать, если нет. Сначала добавь его командой
+`claude mcp add --transport http -s user claude_design https://api.anthropic.com/v1/design/mcp`.
+Затем войди: `/mcp` → `claude_design` → Authenticate. HTML-макеты и PNG работают без него.
 
 **Из клона.** Выбери один способ: с обоими скилл и хук загрузятся дважды.
 Скилл и агент подключаются симлинками, хук — записью в `~/.claude/settings.json`.

@@ -186,3 +186,38 @@ def test_frames_and_canvas_compare(tmp_path):
     assert "== 960:" in r.stdout
     assert 'missing  a "Docs"' in r.stdout
     assert "(+2 inside moved)" in r.stdout
+
+
+def test_claude_design_status_parsing():
+    ok = "claude_design:\n  Scope: User config\n  Status: ✔ Connected\n  Type: http\n"
+    assert mockmatch.parse_mcp_status(0, ok)[0] == "connected"
+    auth = "claude_design:\n  Status: ⚠ Needs authentication\n"
+    state, msg = mockmatch.parse_mcp_status(0, auth)
+    assert state == "auth" and "/mcp" in msg
+    gone = 'No MCP server named "claude_design". Configured servers: context7'
+    state, msg = mockmatch.parse_mcp_status(1, gone)
+    assert state == "missing" and "claude mcp add" in msg
+    assert mockmatch.parse_mcp_status(0, "  Status: ✗ Failed to connect\n")[0] == "failed"
+
+
+def test_design_project_id():
+    pid = "ebae3b89-1338-4e9b-83f8-23f4460aa23b"
+    assert mockmatch.design_project_id(pid) == pid
+    assert mockmatch.design_project_id(f"https://claude.ai/design/p/{pid}?file=x") == pid
+    assert mockmatch.design_project_id("") is None
+
+
+def test_pull_keeps_claude_design_source(tmp_path):
+    class A:
+        project, file = None, None
+    out = tmp_path / "design"
+    out.mkdir()
+    (out / "design.json").write_text(json.dumps({"files": ["home.html"], "claude_design": {"project": "p1", "file": "Home.dc.html", "url": "u"}}))
+    assert mockmatch.claude_design_source(A, str(out), "home.html")["project"] == "p1"
+    assert mockmatch.claude_design_source(A, str(out), "other.html") is None
+    A.project, A.file = "https://claude.ai/design/p/abcdef12-0000", "Other.dc.html"
+    cd = mockmatch.claude_design_source(A, str(out), "other.html")
+    assert cd == {"project": "abcdef12-0000", "file": "Other.dc.html",
+                  "url": "https://claude.ai/design/p/abcdef12-0000?file=Other.dc.html"}
+    A.project, A.file = "https://claude.ai/design/p/abcdef12-0000?file=%D0%9E+x.dc.html", None
+    assert mockmatch.claude_design_source(A, str(out), "o.html")["file"] == "О x.dc.html"

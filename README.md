@@ -33,7 +33,8 @@ which does the same for Android.
   `click`, `type`, `key`, `hover`, `scroll`, `wait`, `assert`, `batch`, `goto`, `back`, `reload`,
   `view` (viewport and theme), `tabs`, `log` (console errors, failed and 4xx/5xx requests),
   `style` (computed styles), `eval`, `look` (a 640 px screenshot for the agent), `shot` (full size, for you).
-- **Design sources.** `pull` saves a rendered Claude Design file locally, without its access token.
+- **Design sources.** `pull` saves a rendered Claude Design file locally, without its access token, and
+  remembers its project and file in `design/design.json`, so the next check refreshes it from the same place.
   `frames` lists the options of a Claude Design canvas with a ready `--frame` selector.
 - **Design check.** `compare` pairs elements by `data-mockmatch`, exact text, then similar text and position.
   For each pair it compares font family, size, weight, line height, letter spacing, color, background,
@@ -47,8 +48,10 @@ which does the same for Android.
 
 ## How a design check goes
 
-1. **Design.** The agent gets a preview URL of the Claude Design file (`render_preview` of the
-   `claude_design` MCP), saves it with `mockmatch pull` and picks the option with `mockmatch frames`.
+1. **Design.** The agent takes the project and file from `design/design.json`, from your
+   `claude.ai/design/p/…` link or from the project list of the `claude_design` MCP. It gets a preview URL
+   (`render_preview`), saves the file with `mockmatch pull --project … --file …` and picks the option
+   with `mockmatch frames`.
 2. **Site.** `mockmatch open http://localhost:5173` — the dev server's page, as text.
 3. **Compare.** `mockmatch compare --design design/page.html --frame '[id="1b"] .dv-card'` prints the lines:
 
@@ -85,6 +88,11 @@ The skill is then called `/mockmatch:mockmatch`. Then ask the agent to run `mock
 with Playwright, Pillow and Chromium in `~/.local/share/mockmatch`, outside the plugin cache, so updates keep it.
 To get a new version: `/plugin marketplace update sp-tools`, then `claude plugin update mockmatch@sp-tools`
 (in the shell).
+
+**Claude Design.** Designs from Claude Design come through the `claude_design` MCP, which needs its own
+login. `mockmatch doctor` shows whether it is connected and what to do if not: add it with
+`claude mcp add --transport http -s user claude_design https://api.anthropic.com/v1/design/mcp`, then
+log in with `/mcp` → `claude_design` → Authenticate. HTML mockups and PNGs work without it.
 
 **From a clone.** Pick one way: with both, the skill and the hook load twice.
 The skill and the agent are symlinks; the hook goes into `~/.claude/settings.json`.

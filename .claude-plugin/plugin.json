@@ -1,6 +1,6 @@
 {
   "name": "mockmatch",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Checks a website against its design and drives a headless browser for the agent with deterministic commands instead of guesses from screenshots: the page as text, clicks that report what changed, input, console errors, computed styles. The design check takes a Claude Design frame, an HTML mockup or a PNG and gives an element-by-element style and geometry diff, pixel regions with crops, an HTML board and a subagent verdict.",
   "author": {
     "name": "Stas Potapov"

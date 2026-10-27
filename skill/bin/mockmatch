@@ -27,7 +27,7 @@ import sys
 import time
 import urllib.parse
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 HOME_DIR = os.path.expanduser(os.environ.get("MOCKMATCH_HOME", "~/.local/share/mockmatch"))
 VENV = os.path.join(HOME_DIR, "venv")
 VENV_PY = os.path.join(VENV, "bin", "python")
